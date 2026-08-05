@@ -628,6 +628,10 @@ impl SceneUniforms {
         arr
     }
 
+    fn lod_count(user_data: &UserData) -> u32 {
+        user_data.n_tiles.0 as u32
+    }
+
     fn from_data(user_data: &UserData, scene_data: &SceneData, render_data: &RenderData) -> Self {
         let render_config = &render_data.render_config;
         Self {
@@ -643,7 +647,7 @@ impl SceneUniforms {
                 0.0
             },
             transition_width_ratio: user_data.lod_transition_width_ratio,
-            num_lod: user_data.n_tiles.1 as u32,
+            num_lod: Self::lod_count(user_data),
             draw_mode: render_config.draw_mode as u32,
 
             map_half_wh: [
@@ -722,5 +726,18 @@ impl TileUniforms {
         }
 
         uniforms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scene_uniform_uses_lod_count_instead_of_tile_count() {
+        let mut user_data = UserData::new();
+        user_data.n_tiles = (6, 16, 9);
+
+        assert_eq!(SceneUniforms::lod_count(&user_data), 6);
     }
 }

@@ -3,47 +3,85 @@ use core::f32;
 use regex::Regex;
 use std::{
     cmp::Ordering,
-    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    io::{BufRead, BufReader, Cursor, Read, Seek},
+    sync::{Arc, LazyLock, Mutex},
 };
 //use wasm_thread as thread;
 
 use crate::log;
 use crate::utils::*;
 
-const MAX_HEADER_LINES: usize = 65;
+const MAX_PLY_HEADER_LINES: usize = 1024;
 const SH_C0: f32 = 0.28209479177387814;
 
-#[derive(Clone)]
-#[repr(C)]
-struct SerializedSplat {
-    position: [f32; 3],   // center of the Gaussian ellipsoid
-    n: [f32; 3],          // unused normal
-    color: [f32; 3 * 16], // RGB(3) + SH(45)
-    alpha: f32,           // opacity
-    scale: [f32; 3],      // scale of the Gaussian
-    rotation: [f32; 4],   // quaternion
-} // 62*f32 (62*4=248bytes) in total
-impl Default for SerializedSplat {
-    fn default() -> Self {
-        unsafe { std::mem::MaybeUninit::<SerializedSplat>::zeroed().assume_init() }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlyScalarType {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+}
+
+impl PlyScalarType {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "char" | "int8" => Some(Self::I8),
+            "uchar" | "uint8" => Some(Self::U8),
+            "short" | "int16" => Some(Self::I16),
+            "ushort" | "uint16" => Some(Self::U16),
+            "int" | "int32" => Some(Self::I32),
+            "uint" | "uint32" => Some(Self::U32),
+            "float" | "float32" => Some(Self::F32),
+            "double" | "float64" => Some(Self::F64),
+            _ => None,
+        }
+    }
+
+    fn size(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
     }
 }
 
-#[derive(Clone)]
-#[repr(C)]
-pub struct SerializedSplat2 {
-    // Scaniverse PLY format (no normals) / SPZ format
-    pub position: [f32; 3],
-    pub scale: [f32; 3],
-    pub rotation: [f32; 4],
-    pub alpha: f32,
-    pub color: [f32; 3 * 16],
-} // 59*f32 (59*4=236bytes) in total
-impl Default for SerializedSplat2 {
-    fn default() -> Self {
-        unsafe { std::mem::MaybeUninit::<SerializedSplat2>::zeroed().assume_init() }
+#[derive(Clone, Copy, Debug)]
+struct PlyProperty {
+    offset: usize,
+    scalar_type: PlyScalarType,
+}
+
+#[derive(Debug)]
+struct PlyHeader {
+    data_offset: usize,
+    splat_count: usize,
+    vertex_stride: usize,
+    properties: HashMap<String, PlyProperty>,
+}
+
+static CONSTRUCTOR_TILE_FILENAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^tile(\d+)_lod(\d+)\.(?:ply|splat)$").unwrap());
+static LEGACY_TILE_FILENAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^lod(\d+)_tile_(\d+)\.(?:ply|splat)$").unwrap());
+
+fn parse_tile_filename(filename: &str) -> Option<(usize, usize)> {
+    if let Some(captures) = CONSTRUCTOR_TILE_FILENAME.captures(filename) {
+        let tile_id = captures.get(1)?.as_str().parse().ok()?;
+        let lod_id = captures.get(2)?.as_str().parse().ok()?;
+        return Some((lod_id, tile_id));
     }
+
+    let captures = LEGACY_TILE_FILENAME.captures(filename)?;
+    let lod_id = captures.get(1)?.as_str().parse().ok()?;
+    let tile_id = captures.get(2)?.as_str().parse().ok()?;
+    Some((lod_id, tile_id))
 }
 
 /// A point cloud of Gaussian splats
@@ -67,239 +105,233 @@ impl Scene {
         }
     }
 
-    /// Parses the header of a PLY file
-    /// Returns the header length in bytes, the number of splats in the file, and the file cursor
-    pub fn parse_file_header(bytes: Vec<u8>) -> Result<(u16, usize, Cursor<Vec<u8>>), String> {
+    fn parse_ply_header(bytes: &[u8]) -> Result<PlyHeader, String> {
         let mut reader = BufReader::new(Cursor::new(bytes));
         let mut line = String::new();
-        let mut splat_count: usize = 0;
-        let mut success = false;
-        let mut i = 0;
+        let mut line_number = 0_usize;
+        let mut saw_ply = false;
+        let mut saw_binary_little_endian = false;
+        let mut current_element = String::new();
+        let mut splat_count = None;
+        let mut vertex_stride = 0_usize;
+        let mut properties = HashMap::new();
 
         loop {
-            reader.read_line(&mut line).unwrap();
-            if line == "end_header\n" {
-                success = true;
-                break;
-            }
-            if line.starts_with("element vertex ") {
-                splat_count = line[15..line.len() - 1].parse().unwrap();
-            }
             line.clear();
+            let bytes_read = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("could not read PLY header: {error}"))?;
+            if bytes_read == 0 {
+                return Err("PLY header ended before end_header".to_string());
+            }
 
-            i += 1;
-            if i > MAX_HEADER_LINES {
+            line_number += 1;
+            if line_number > MAX_PLY_HEADER_LINES {
+                return Err(format!(
+                    "PLY header exceeds the supported limit of {MAX_PLY_HEADER_LINES} lines"
+                ));
+            }
+
+            let header_line = line.trim_end_matches(['\r', '\n']);
+            if line_number == 1 {
+                if header_line != "ply" {
+                    return Err("file does not start with a PLY header".to_string());
+                }
+                saw_ply = true;
+                continue;
+            }
+
+            if header_line == "end_header" {
                 break;
             }
+
+            let fields = header_line.split_whitespace().collect::<Vec<_>>();
+            match fields.as_slice() {
+                ["format", "binary_little_endian", "1.0"] => {
+                    saw_binary_little_endian = true;
+                }
+                ["format", format, version] => {
+                    return Err(format!(
+                        "unsupported PLY format '{format} {version}'; expected binary_little_endian 1.0"
+                    ));
+                }
+                ["element", name, count] => {
+                    current_element = (*name).to_string();
+                    if *name == "vertex" {
+                        splat_count = Some(count.parse::<usize>().map_err(|_| {
+                            format!("invalid vertex count '{count}' in PLY header")
+                        })?);
+                    }
+                }
+                ["property", "list", ..] if current_element == "vertex" => {
+                    return Err("list-valued vertex properties are not supported".to_string());
+                }
+                ["property", scalar_type, name] if current_element == "vertex" => {
+                    let scalar_type = PlyScalarType::parse(scalar_type).ok_or_else(|| {
+                        format!("unsupported PLY scalar type '{scalar_type}' for property '{name}'")
+                    })?;
+                    if properties
+                        .insert(
+                            (*name).to_string(),
+                            PlyProperty {
+                                offset: vertex_stride,
+                                scalar_type,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(format!("duplicate PLY vertex property '{name}'"));
+                    }
+                    vertex_stride = vertex_stride
+                        .checked_add(scalar_type.size())
+                        .ok_or_else(|| "PLY vertex stride overflowed usize".to_string())?;
+                }
+                _ => {}
+            }
         }
 
-        if !success {
-            let error = "Scene::parse_file_header(): ERROR: the file is not correctly formatted.";
-            log!("{}, i={}", error, i);
-            return Err(error.to_string());
+        if !saw_ply {
+            return Err("missing PLY signature".to_string());
         }
+        if !saw_binary_little_endian {
+            return Err("PLY must use binary_little_endian 1.0".to_string());
+        }
+        let splat_count = splat_count.ok_or_else(|| "missing PLY vertex element".to_string())?;
+        let data_offset = reader
+            .stream_position()
+            .map_err(|error| format!("could not locate PLY vertex data: {error}"))?
+            as usize;
 
-        let file_header_size = reader.stream_position().unwrap() as u16;
-        let cursor = reader.into_inner();
-        log!(
-            "Scene::parse_file_header(): i={}, file_header_size={}, splat_count={}",
-            i,
-            file_header_size,
-            splat_count
-        );
-
-        Ok((file_header_size, splat_count, cursor))
+        Ok(PlyHeader {
+            data_offset,
+            splat_count,
+            vertex_stride,
+            properties,
+        })
     }
 
-    /// Loads an entire PLY file into WASM memory
-    pub fn load(&mut self, cursor: &mut Cursor<Vec<u8>>, file_header_size: u16) {
-        let mut serialized_splats = vec![SerializedSplat::default(); self.splat_count];
-        cursor
-            .seek(SeekFrom::Start(file_header_size as u64))
-            .unwrap();
-        cursor
-            .read_exact(transmute_slice_mut::<_, u8>(
-                serialized_splats.as_mut_slice(),
-            ))
-            .unwrap();
+    /// Loads binary little-endian Gaussian PLY data by property name.
+    /// Optional properties such as normals and higher-order SH coefficients are ignored.
+    pub fn from_ply_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        let header = Self::parse_ply_header(&bytes)?;
+        let property_offset = |name: &str| -> Result<usize, String> {
+            let property = header
+                .properties
+                .get(name)
+                .ok_or_else(|| format!("missing required PLY vertex property '{name}'"))?;
+            if property.scalar_type != PlyScalarType::F32 {
+                return Err(format!(
+                    "PLY vertex property '{name}' must be float32, found {:?}",
+                    property.scalar_type
+                ));
+            }
+            Ok(property.offset)
+        };
 
-        // calculate importance of each splat
-        let mut size_list = vec![0_f32; self.splat_count];
-        let mut size_index = vec![0_u32; self.splat_count];
-        for i in 0..self.splat_count {
-            let s = &serialized_splats[i];
-            size_index[i] = i as u32;
-            let size = s.scale[0].exp() * s.scale[1].exp() * s.scale[2].exp();
-            let opacity = 1.0 / (1.0 + (-s.alpha).exp());
-            size_list[i] = (size as f32) * opacity;
+        let position_offsets = [
+            property_offset("x")?,
+            property_offset("y")?,
+            property_offset("z")?,
+        ];
+        let color_offsets = [
+            property_offset("f_dc_0")?,
+            property_offset("f_dc_1")?,
+            property_offset("f_dc_2")?,
+        ];
+        let opacity_offset = property_offset("opacity")?;
+        let scale_offsets = [
+            property_offset("scale_0")?,
+            property_offset("scale_1")?,
+            property_offset("scale_2")?,
+        ];
+        let rotation_offsets = [
+            property_offset("rot_0")?,
+            property_offset("rot_1")?,
+            property_offset("rot_2")?,
+            property_offset("rot_3")?,
+        ];
+
+        let vertex_bytes = header
+            .splat_count
+            .checked_mul(header.vertex_stride)
+            .ok_or_else(|| "PLY vertex data size overflowed usize".to_string())?;
+        let expected_length = header
+            .data_offset
+            .checked_add(vertex_bytes)
+            .ok_or_else(|| "PLY file size overflowed usize".to_string())?;
+        if bytes.len() < expected_length {
+            return Err(format!(
+                "truncated PLY vertex data: expected at least {expected_length} bytes, found {}",
+                bytes.len()
+            ));
         }
 
-        // sort the indices of splats based on size_list in descending order
-        size_index.sort_by(|&a, &b| {
-            size_list[b as usize]
-                .partial_cmp(&size_list[a as usize])
+        let read_f32 = |record: &[u8], offset: usize| -> f32 {
+            f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
+        };
+        let record_at = |index: usize| -> &[u8] {
+            let start = header.data_offset + index * header.vertex_stride;
+            &bytes[start..start + header.vertex_stride]
+        };
+
+        let importance = (0..header.splat_count)
+            .map(|index| {
+                let record = record_at(index);
+                let scale = scale_offsets
+                    .iter()
+                    .map(|&offset| read_f32(record, offset).exp())
+                    .product::<f32>();
+                let opacity = 1.0 / (1.0 + (-read_f32(record, opacity_offset)).exp());
+                scale * opacity
+            })
+            .collect::<Vec<_>>();
+        let mut sorted_indices = (0..header.splat_count).collect::<Vec<_>>();
+        sorted_indices.sort_by(|&a, &b| {
+            importance[b]
+                .partial_cmp(&importance[a])
                 .unwrap_or(Ordering::Equal)
         });
-        log!(
-            "Scene::load(): size_list[0]={}, size_list[-1]={}",
-            size_list[size_index[0] as usize],
-            size_list[size_index[size_index.len() - 1] as usize]
-        );
 
-        // construct a new binary buffer where each row corresponds to a splat in the sorted order.
-        // XYZ - position (f32)
-        // XYZ - scale (f32)
-        // RGBA - color (u8)
-        // IJKL - quaternion (u8)
-        let row_length = 3 * 4 + 3 * 4 + 4 + 4; // 32bytes
-        let mut buffer = vec![0_u8; row_length * self.splat_count];
-        for i in 0..self.splat_count {
-            let row = size_index[i] as usize;
-            let s = &serialized_splats[row];
+        const ROW_LENGTH: usize = 32;
+        let mut buffer = vec![0_u8; ROW_LENGTH * header.splat_count];
+        for (output_index, source_index) in sorted_indices.into_iter().enumerate() {
+            let record = record_at(source_index);
+            let output = &mut buffer[output_index * ROW_LENGTH..(output_index + 1) * ROW_LENGTH];
 
-            let mut start = i * row_length;
-            let mut end = start + 3 * 4;
-            {
-                // read 3x f32
-                let position: &mut [f32] = transmute_slice_mut::<_, f32>(&mut buffer[start..end]);
-                position[0] = s.position[0];
-                position[1] = s.position[1];
-                position[2] = s.position[2];
+            for (component, &offset) in position_offsets.iter().enumerate() {
+                let start = component * 4;
+                output[start..start + 4].copy_from_slice(&read_f32(record, offset).to_le_bytes());
             }
-
-            start = end;
-            end = start + 3 * 4;
-            {
-                // read 3x f32
-                let scales: &mut [f32] = transmute_slice_mut::<_, f32>(&mut buffer[start..end]);
-                scales[0] = s.scale[0].exp();
-                scales[1] = s.scale[1].exp();
-                scales[2] = s.scale[2].exp();
+            for (component, &offset) in scale_offsets.iter().enumerate() {
+                let start = 12 + component * 4;
+                output[start..start + 4]
+                    .copy_from_slice(&read_f32(record, offset).exp().to_le_bytes());
             }
-
-            // In Rust, float-to-integer casts saturate
-            // (i.e., excess values are converted to T::MAX or T::MIN. NaN is converted to 0).
-
-            start = end;
-            end = start + 4;
-            {
-                // read 4x u8
-                let rgba: &mut [u8] = transmute_slice_mut::<_, u8>(&mut buffer[start..end]);
-                rgba[0] = ((0.5 + SH_C0 * s.color[0]) * 255.0) as u8;
-                rgba[1] = ((0.5 + SH_C0 * s.color[1]) * 255.0) as u8;
-                rgba[2] = ((0.5 + SH_C0 * s.color[2]) * 255.0) as u8;
-                rgba[3] = ((1.0 / (1.0 + (-s.alpha).exp())) * 255.0) as u8; // opacity from sigmoid
+            for (component, &offset) in color_offsets.iter().enumerate() {
+                output[24 + component] = ((0.5 + SH_C0 * read_f32(record, offset)) * 255.0) as u8;
             }
+            output[27] = ((1.0 / (1.0 + (-read_f32(record, opacity_offset)).exp())) * 255.0) as u8;
 
-            start = end;
-            end = start + 4;
-            {
-                // read 4x u8
-                let rot: &mut [u8] = transmute_slice_mut::<_, u8>(&mut buffer[start..end]);
-                let qlen = (s.rotation[0].powi(2)
-                    + s.rotation[1].powi(2)
-                    + s.rotation[2].powi(2)
-                    + s.rotation[3].powi(2))
+            let rotation = rotation_offsets.map(|offset| read_f32(record, offset));
+            let rotation_length = rotation
+                .iter()
+                .map(|value| value.powi(2))
+                .sum::<f32>()
                 .sqrt();
-                // [-1, 1] -> [0, 255]
-                rot[0] = (((s.rotation[0] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[1] = (((s.rotation[1] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[2] = (((s.rotation[2] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[3] = (((s.rotation[3] / qlen) + 1.0) * 0.5 * 255.0) as u8;
+            if !rotation_length.is_finite() || rotation_length == 0.0 {
+                return Err(format!(
+                    "PLY vertex {source_index} has an invalid zero or non-finite rotation"
+                ));
+            }
+            for (component, value) in rotation.into_iter().enumerate() {
+                output[28 + component] = (((value / rotation_length) + 1.0) * 0.5 * 255.0) as u8;
             }
         }
-        self.buffer = buffer;
-    }
 
-    /// Loads an entire PLY file (w/o normals) into WASM memory
-    pub fn load_no_normal(&mut self, serialized_splats: Vec<SerializedSplat2>) {
-        // TODO: remove code redundancy w/ load()
-        // calculate importance of each splat
-        let mut size_list = vec![0_f32; self.splat_count];
-        let mut size_index = vec![0_u32; self.splat_count];
-        for i in 0..self.splat_count {
-            let s = &serialized_splats[i];
-            size_index[i] = i as u32;
-            let size = s.scale[0].exp() * s.scale[1].exp() * s.scale[2].exp();
-            let opacity = 1.0 / (1.0 + (-s.alpha).exp());
-            size_list[i] = (size as f32) * opacity;
-        }
-
-        // sort the indices of splats based on size_list in descending order
-        size_index.sort_by(|&a, &b| {
-            size_list[b as usize]
-                .partial_cmp(&size_list[a as usize])
-                .unwrap_or(Ordering::Equal)
-        });
-        log!(
-            "Scene::load_no_normal(): size_list[0]={}, size_list[-1]={}",
-            size_list[size_index[0] as usize],
-            size_list[size_index[size_index.len() - 1] as usize]
-        );
-
-        // construct a new binary buffer where each row corresponds to a splat in the sorted order.
-        // XYZ - position (f32)
-        // XYZ - scale (f32)
-        // RGBA - color (u8)
-        // IJKL - quaternion (u8)
-        let row_length = 3 * 4 + 3 * 4 + 4 + 4; // 32bytes
-        let mut buffer = vec![0_u8; row_length * self.splat_count];
-        for i in 0..self.splat_count {
-            let row = size_index[i] as usize;
-            let s = &serialized_splats[row];
-
-            let mut start = i * row_length;
-            let mut end = start + 3 * 4;
-            {
-                // read 3x f32
-                let position: &mut [f32] = transmute_slice_mut::<_, f32>(&mut buffer[start..end]);
-                position[0] = s.position[0];
-                position[1] = s.position[1];
-                position[2] = s.position[2];
-            }
-
-            start = end;
-            end = start + 3 * 4;
-            {
-                // read 3x f32
-                let scales: &mut [f32] = transmute_slice_mut::<_, f32>(&mut buffer[start..end]);
-                scales[0] = s.scale[0].exp();
-                scales[1] = s.scale[1].exp();
-                scales[2] = s.scale[2].exp();
-            }
-
-            // In Rust, float-to-integer casts saturate
-            // (i.e., excess values are converted to T::MAX or T::MIN. NaN is converted to 0).
-
-            start = end;
-            end = start + 4;
-            {
-                // read 4x u8
-                let rgba: &mut [u8] = transmute_slice_mut::<_, u8>(&mut buffer[start..end]);
-                rgba[0] = ((0.5 + SH_C0 * s.color[0]) * 255.0) as u8;
-                rgba[1] = ((0.5 + SH_C0 * s.color[1]) * 255.0) as u8;
-                rgba[2] = ((0.5 + SH_C0 * s.color[2]) * 255.0) as u8;
-                rgba[3] = ((1.0 / (1.0 + (-s.alpha).exp())) * 255.0) as u8; // opacity from sigmoid
-            }
-
-            start = end;
-            end = start + 4;
-            {
-                // read 4x u8
-                let rot: &mut [u8] = transmute_slice_mut::<_, u8>(&mut buffer[start..end]);
-                let qlen = (s.rotation[0].powi(2)
-                    + s.rotation[1].powi(2)
-                    + s.rotation[2].powi(2)
-                    + s.rotation[3].powi(2))
-                .sqrt();
-                // [-1, 1] -> [0, 255]
-                rot[0] = (((s.rotation[0] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[1] = (((s.rotation[1] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[2] = (((s.rotation[2] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                rot[3] = (((s.rotation[3] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-            }
-        }
-        self.buffer = buffer;
+        let mut scene = Self::new();
+        scene.splat_count = header.splat_count;
+        scene.buffer = buffer;
+        Ok(scene)
     }
 
     /// Generates a 2D texture from the splats
@@ -900,23 +932,14 @@ pub async fn load_scene() -> Scene {
         .await;
     if let Some(f) = file.as_ref() {
         if f.file_name().contains(".ply") {
-            let mut file_header_size = 0_u16;
-            let mut splat_count = 0_usize;
-            let mut cursor = Cursor::new(Vec::<u8>::new());
             let bytes = f.read().await;
-            match Scene::parse_file_header(bytes) {
-                Ok((fhs, sc, c)) => {
-                    file_header_size = fhs;
-                    splat_count = sc;
-                    cursor = c;
-                }
+            scene = match Scene::from_ply_bytes(bytes) {
+                Ok(scene) => scene,
                 Err(e) => {
                     log!("load_scene(): ERROR: {}", e);
                     unreachable!();
                 }
-            }
-            scene.splat_count = splat_count;
-            scene.load(&mut cursor, file_header_size);
+            };
         } else if f.file_name().contains(".splat") {
             scene.buffer = f.read().await;
             scene.splat_count = scene.buffer.len() / 32; // 32bytes per splat
@@ -951,32 +974,14 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
     }
 
     let mut file_vec = file_vec.unwrap();
-    let re = Regex::new(r"lod(\d+)_tile_(\d+)").unwrap();
     file_vec.sort_by_key(|s| {
         let filename = s.file_name();
-        let caps = re.captures(filename.as_str()).unwrap();
-        let strs = (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str());
-        let nums = (
-            strs.0.parse::<i32>().unwrap(),
-            strs.1.parse::<i32>().unwrap(),
-        );
-
-        nums
+        parse_tile_filename(filename.as_str()).unwrap()
     });
     let first_filename = file_vec.first().unwrap().file_name();
-    let caps = re.captures(first_filename.as_str()).unwrap();
-    let strs = (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str());
-    let first_nums = (
-        strs.0.parse::<i32>().unwrap(),
-        strs.1.parse::<i32>().unwrap(),
-    );
+    let first_nums = parse_tile_filename(first_filename.as_str()).unwrap();
     let last_filename = file_vec.last().unwrap().file_name();
-    let caps = re.captures(last_filename.as_str()).unwrap();
-    let strs = (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str());
-    let last_nums = (
-        strs.0.parse::<i32>().unwrap(),
-        strs.1.parse::<i32>().unwrap(),
-    );
+    let last_nums = parse_tile_filename(last_filename.as_str()).unwrap();
 
     let n_lod = last_nums.0 as usize - first_nums.0 as usize + 1;
     let n_tile = last_nums.1 as usize + 1;
@@ -990,23 +995,14 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
             let mut scene = Scene::new();
 
             if f.file_name().contains(".ply") {
-                let mut file_header_size = 0_u16;
-                let mut splat_count = 0_usize;
-                let mut cursor = Cursor::new(Vec::<u8>::new());
                 let bytes = f.read().await;
-                match Scene::parse_file_header(bytes) {
-                    Ok((fhs, sc, c)) => {
-                        file_header_size = fhs;
-                        splat_count = sc;
-                        cursor = c;
-                    }
+                scene = match Scene::from_ply_bytes(bytes) {
+                    Ok(scene) => scene,
                     Err(e) => {
                         log!("load_scene(): ERROR: {}", e);
                         unreachable!();
                     }
-                }
-                scene.splat_count = splat_count;
-                scene.load(&mut cursor, file_header_size);
+                };
             } else if f.file_name().contains(".splat") {
                 scene.buffer = f.read().await;
                 scene.splat_count = scene.buffer.len() / 32; // 32bytes per splat
@@ -1054,7 +1050,6 @@ pub async fn load_scene_zip() -> Vec<Vec<Scene>> {
         lod_id: usize,
         tile_id: usize,
     }
-    let re = Regex::new(r"lod(\d+)_tile_(\d+)").unwrap();
     let mut file_vec: Vec<SceneFileEntry> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i).unwrap();
@@ -1066,11 +1061,7 @@ pub async fn load_scene_zip() -> Vec<Vec<Scene>> {
             .to_str()
             .unwrap()
             .to_string();
-        let opt_caps = re.captures(filename.as_str());
-        if let Some(caps) = opt_caps {
-            let strs = (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str());
-            let lod_id = strs.0.parse::<usize>().unwrap();
-            let tile_id = strs.1.parse::<usize>().unwrap();
+        if let Some((lod_id, tile_id)) = parse_tile_filename(filename.as_str()) {
             let entry = SceneFileEntry {
                 index: i,
                 filename,
@@ -1097,26 +1088,17 @@ pub async fn load_scene_zip() -> Vec<Vec<Scene>> {
             let mut scene = Scene::new();
 
             if file_entry.filename.contains(".ply") {
-                let mut file_header_size = 0_u16;
-                let mut splat_count = 0_usize;
-                let mut cursor = Cursor::new(Vec::<u8>::new());
                 let mut file = archive.by_index(file_entry.index).unwrap();
                 let mut bytes = vec![0_u8; file.size() as usize];
                 file.read_exact(&mut bytes.as_mut_slice())
                     .expect(format!("Error loading file: {}", file_entry.filename).as_str());
-                match Scene::parse_file_header(bytes) {
-                    Ok((fhs, sc, c)) => {
-                        file_header_size = fhs;
-                        splat_count = sc;
-                        cursor = c;
-                    }
+                scene = match Scene::from_ply_bytes(bytes) {
+                    Ok(scene) => scene,
                     Err(e) => {
                         log!("load_scene(): ERROR: {}", e);
                         unreachable!();
                     }
-                }
-                scene.splat_count = splat_count;
-                scene.load(&mut cursor, file_header_size);
+                };
             } else if file_entry.filename.contains(".splat") {
                 let mut file = archive.by_index(file_entry.index).unwrap();
                 let mut bytes = vec![0_u8; file.size() as usize];
@@ -1168,4 +1150,124 @@ pub fn translate_scene(scene: &Scene, offset: Vec3, gen_tex: bool) -> Scene {
     }
 
     new_scene
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_binary_ply(properties: &[&str], values: &[f32]) -> Vec<u8> {
+        assert_eq!(properties.len(), values.len());
+
+        let mut bytes = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            properties
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        )
+        .into_bytes();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn constructor_properties() -> [&'static str; 14] {
+        [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ]
+    }
+
+    fn constructor_values() -> [f32; 14] {
+        [
+            1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        ]
+    }
+
+    fn read_f32(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn parses_constructor_tile_filename() {
+        assert_eq!(parse_tile_filename("tile15_lod5.ply"), Some((5, 15)));
+    }
+
+    #[test]
+    fn preserves_legacy_tile_filename_support() {
+        assert_eq!(parse_tile_filename("lod5_tile_15.ply"), Some((5, 15)));
+    }
+
+    #[test]
+    fn rejects_partial_tile_filename_matches() {
+        assert_eq!(parse_tile_filename("backup_tile15_lod5.ply.tmp"), None);
+    }
+
+    #[test]
+    fn loads_constructor_ply_without_normals() {
+        let scene = Scene::from_ply_bytes(make_binary_ply(
+            &constructor_properties(),
+            &constructor_values(),
+        ))
+        .unwrap();
+
+        assert_eq!(scene.splat_count, 1);
+        assert_eq!(read_f32(&scene.buffer, 0), 1.0);
+        assert_eq!(read_f32(&scene.buffer, 4), 2.0);
+        assert_eq!(read_f32(&scene.buffer, 8), 3.0);
+        assert_eq!(read_f32(&scene.buffer, 12), 1.0);
+        assert_eq!(read_f32(&scene.buffer, 16), 1.0);
+        assert_eq!(read_f32(&scene.buffer, 20), 1.0);
+        assert_eq!(&scene.buffer[24..28], &[127, 127, 127, 127]);
+        assert_eq!(&scene.buffer[28..32], &[255, 127, 127, 127]);
+    }
+
+    #[test]
+    fn ignores_optional_normals_and_spherical_harmonics() {
+        let properties = [
+            "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "f_rest_0", "opacity",
+            "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let values = [
+            1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 42.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0,
+        ];
+
+        let scene = Scene::from_ply_bytes(make_binary_ply(&properties, &values)).unwrap();
+
+        assert_eq!(scene.splat_count, 1);
+        assert_eq!(read_f32(&scene.buffer, 0), 1.0);
+        assert_eq!(read_f32(&scene.buffer, 12), 1.0);
+        assert_eq!(&scene.buffer[24..28], &[127, 127, 127, 127]);
+        assert_eq!(&scene.buffer[28..32], &[255, 127, 127, 127]);
+    }
+
+    #[test]
+    fn rejects_ply_missing_required_property() {
+        let properties = constructor_properties();
+        let values = constructor_values();
+        let opacity_index = properties
+            .iter()
+            .position(|name| *name == "opacity")
+            .unwrap();
+        let properties = properties
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, name)| (index != opacity_index).then_some(name))
+            .collect::<Vec<_>>();
+        let values = values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (index != opacity_index).then_some(value))
+            .collect::<Vec<_>>();
+
+        let error = match Scene::from_ply_bytes(make_binary_ply(&properties, &values)) {
+            Ok(_) => panic!("expected missing opacity to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("opacity"), "{error}");
+    }
 }
