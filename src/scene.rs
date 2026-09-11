@@ -2,14 +2,14 @@ use bus::Bus;
 use core::f32;
 use regex::Regex;
 use std::{
-    cmp::Ordering,
     collections::HashMap,
-    io::{BufRead, BufReader, Cursor, Read, Seek},
+    io::{BufRead, BufReader, Cursor, Seek},
     sync::{Arc, LazyLock, Mutex},
 };
 //use wasm_thread as thread;
 
 use crate::log;
+use crate::motion::{CanonicalGaussian, normalize_quaternion};
 use crate::utils::*;
 
 const MAX_PLY_HEADER_LINES: usize = 1024;
@@ -71,7 +71,7 @@ static CONSTRUCTOR_TILE_FILENAME: LazyLock<Regex> =
 static LEGACY_TILE_FILENAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^lod(\d+)_tile_(\d+)\.(?:ply|splat)$").unwrap());
 
-fn parse_tile_filename(filename: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_tile_filename(filename: &str) -> Option<(usize, usize)> {
     if let Some(captures) = CONSTRUCTOR_TILE_FILENAME.captures(filename) {
         let tile_id = captures.get(1)?.as_str().parse().ok()?;
         let lod_id = captures.get(2)?.as_str().parse().ok()?;
@@ -93,6 +93,13 @@ pub struct Scene {
     pub(crate) tex_height: usize,
     prev_vp: Mutex<Vec<f32>>,
 }
+
+pub struct ParsedPlyScene {
+    pub scene: Scene,
+    pub canonical: Vec<CanonicalGaussian>,
+    pub source_rows: Vec<usize>,
+}
+
 impl Scene {
     pub fn new() -> Self {
         Self {
@@ -213,6 +220,12 @@ impl Scene {
     /// Loads binary little-endian Gaussian PLY data by property name.
     /// Optional properties such as normals and higher-order SH coefficients are ignored.
     pub fn from_ply_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        Ok(Self::from_ply_bytes_with_identity(bytes)?.scene)
+    }
+
+    /// Loads a Gaussian PLY while retaining the output-to-source row permutation and
+    /// full-precision canonical kinematic state in renderer row order.
+    pub fn from_ply_bytes_with_identity(bytes: Vec<u8>) -> Result<ParsedPlyScene, String> {
         let header = Self::parse_ply_header(&bytes)?;
         let property_offset = |name: &str| -> Result<usize, String> {
             let property = header
@@ -277,61 +290,96 @@ impl Scene {
         let importance = (0..header.splat_count)
             .map(|index| {
                 let record = record_at(index);
-                let scale = scale_offsets
+                let required_values = position_offsets
+                    .iter()
+                    .chain(color_offsets.iter())
+                    .chain(std::iter::once(&opacity_offset))
+                    .chain(scale_offsets.iter())
+                    .chain(rotation_offsets.iter())
+                    .map(|&offset| read_f32(record, offset))
+                    .collect::<Vec<_>>();
+                if required_values.iter().any(|value| !value.is_finite()) {
+                    return Err(format!(
+                        "PLY vertex {index} has a non-finite required property"
+                    ));
+                }
+                let linear_scale = scale_offsets
                     .iter()
                     .map(|&offset| read_f32(record, offset).exp())
-                    .product::<f32>();
+                    .collect::<Vec<_>>();
+                if linear_scale.iter().any(|value| !value.is_finite()) {
+                    return Err(format!(
+                        "PLY vertex {index} has a scale outside the finite renderer range"
+                    ));
+                }
+                let scale_product = linear_scale.into_iter().product::<f32>();
                 let opacity = 1.0 / (1.0 + (-read_f32(record, opacity_offset)).exp());
-                scale * opacity
+                let importance = scale_product * opacity;
+                if !importance.is_finite() {
+                    return Err(format!(
+                        "PLY vertex {index} has non-finite derived importance"
+                    ));
+                }
+                Ok(importance)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         let mut sorted_indices = (0..header.splat_count).collect::<Vec<_>>();
         sorted_indices.sort_by(|&a, &b| {
             importance[b]
-                .partial_cmp(&importance[a])
-                .unwrap_or(Ordering::Equal)
+                .total_cmp(&importance[a])
+                .then_with(|| a.cmp(&b))
         });
 
         const ROW_LENGTH: usize = 32;
         let mut buffer = vec![0_u8; ROW_LENGTH * header.splat_count];
-        for (output_index, source_index) in sorted_indices.into_iter().enumerate() {
+        let mut canonical = Vec::with_capacity(header.splat_count);
+        for (output_index, source_index) in sorted_indices.iter().copied().enumerate() {
             let record = record_at(source_index);
             let output = &mut buffer[output_index * ROW_LENGTH..(output_index + 1) * ROW_LENGTH];
 
-            for (component, &offset) in position_offsets.iter().enumerate() {
+            let position = position_offsets.map(|offset| read_f32(record, offset));
+            let log_scale = scale_offsets.map(|offset| read_f32(record, offset));
+            let source_rotation = rotation_offsets.map(|offset| read_f32(record, offset));
+            let rotation = normalize_quaternion(source_rotation).map_err(|error| {
+                format!("PLY vertex {source_index} has invalid rotation: {error}")
+            })?;
+            let packed_rotation = if source_rotation[0] < 0.0 {
+                rotation.map(|value| -value)
+            } else {
+                rotation
+            };
+            canonical.push(CanonicalGaussian {
+                position,
+                log_scale,
+                rotation,
+            });
+
+            for (component, value) in position.into_iter().enumerate() {
                 let start = component * 4;
-                output[start..start + 4].copy_from_slice(&read_f32(record, offset).to_le_bytes());
+                output[start..start + 4].copy_from_slice(&value.to_le_bytes());
             }
-            for (component, &offset) in scale_offsets.iter().enumerate() {
+            for (component, value) in log_scale.into_iter().enumerate() {
                 let start = 12 + component * 4;
-                output[start..start + 4]
-                    .copy_from_slice(&read_f32(record, offset).exp().to_le_bytes());
+                output[start..start + 4].copy_from_slice(&value.exp().to_le_bytes());
             }
             for (component, &offset) in color_offsets.iter().enumerate() {
                 output[24 + component] = ((0.5 + SH_C0 * read_f32(record, offset)) * 255.0) as u8;
             }
             output[27] = ((1.0 / (1.0 + (-read_f32(record, opacity_offset)).exp())) * 255.0) as u8;
 
-            let rotation = rotation_offsets.map(|offset| read_f32(record, offset));
-            let rotation_length = rotation
-                .iter()
-                .map(|value| value.powi(2))
-                .sum::<f32>()
-                .sqrt();
-            if !rotation_length.is_finite() || rotation_length == 0.0 {
-                return Err(format!(
-                    "PLY vertex {source_index} has an invalid zero or non-finite rotation"
-                ));
-            }
-            for (component, value) in rotation.into_iter().enumerate() {
-                output[28 + component] = (((value / rotation_length) + 1.0) * 0.5 * 255.0) as u8;
+            for (component, value) in packed_rotation.into_iter().enumerate() {
+                output[28 + component] = ((value + 1.0) * 0.5 * 255.0) as u8;
             }
         }
 
         let mut scene = Self::new();
         scene.splat_count = header.splat_count;
         scene.buffer = buffer;
-        Ok(scene)
+        Ok(ParsedPlyScene {
+            scene,
+            canonical,
+            source_rows: sorted_indices,
+        })
     }
 
     /// Generates a 2D texture from the splats
@@ -1023,105 +1071,6 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
     scene_vec
 }
 
-pub async fn load_scene_zip() -> Vec<Vec<Scene>> {
-    /*
-    A WebAssembly page has a constant size of 65,536 bytes (or 64KB).
-    Therefore, the maximum range that a WASM module can address,
-    as WASM currently only allows 32-bit addressing, is 2^16 * 64KB = 4GB.
-    */
-
-    let file_zip = rfd::AsyncFileDialog::new()
-        .set_title("Upload Tiles (.zip)")
-        .add_filter("Tiles", &["zip"])
-        .pick_file()
-        .await;
-
-    if file_zip.is_none() {
-        return Vec::new();
-    }
-    let file_zip = file_zip.unwrap().read().await;
-    let file_cursor = Cursor::new(file_zip);
-    let mut archive = zip::ZipArchive::new(file_cursor).unwrap();
-
-    // Extract zip
-    struct SceneFileEntry {
-        index: usize,
-        filename: String,
-        lod_id: usize,
-        tile_id: usize,
-    }
-    let mut file_vec: Vec<SceneFileEntry> = Vec::new();
-    for i in 0..archive.len() {
-        let file = archive.by_index(i).unwrap();
-        let filename = file
-            .enclosed_name()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        if let Some((lod_id, tile_id)) = parse_tile_filename(filename.as_str()) {
-            let entry = SceneFileEntry {
-                index: i,
-                filename,
-                lod_id,
-                tile_id,
-            };
-            file_vec.push(entry);
-        }
-    }
-
-    file_vec.sort_by_key(|e| (e.lod_id, e.tile_id));
-    let first_entry = file_vec.first().unwrap();
-    let last_entry = file_vec.last().unwrap();
-
-    let n_lod = last_entry.lod_id - first_entry.lod_id + 1;
-    let n_tile = last_entry.tile_id as usize + 1;
-
-    let mut scene_vec: Vec<Vec<Scene>> = Vec::with_capacity(n_lod);
-
-    for i in 0..n_lod {
-        let mut lod_vec: Vec<Scene> = Vec::with_capacity(n_tile);
-        for j in 0..n_tile {
-            let file_entry = &file_vec[i * n_tile + j];
-            let mut scene = Scene::new();
-
-            if file_entry.filename.contains(".ply") {
-                let mut file = archive.by_index(file_entry.index).unwrap();
-                let mut bytes = vec![0_u8; file.size() as usize];
-                file.read_exact(&mut bytes.as_mut_slice())
-                    .expect(format!("Error loading file: {}", file_entry.filename).as_str());
-                scene = match Scene::from_ply_bytes(bytes) {
-                    Ok(scene) => scene,
-                    Err(e) => {
-                        log!("load_scene(): ERROR: {}", e);
-                        unreachable!();
-                    }
-                };
-            } else if file_entry.filename.contains(".splat") {
-                let mut file = archive.by_index(file_entry.index).unwrap();
-                let mut bytes = vec![0_u8; file.size() as usize];
-                file.read(&mut bytes.as_mut_slice())
-                    .expect(format!("Error loading file: {}", file_entry.filename).as_str());
-                scene.splat_count = scene.buffer.len() / 32; // 32bytes per splat
-            } else {
-                unreachable!();
-            }
-
-            // scene.generate_texture();
-
-            log!("load_scene(): {}", file_entry.filename);
-            log!("load_scene(): scene.splat_count={}", scene.splat_count);
-
-            lod_vec.push(scene);
-        }
-        scene_vec.push(lod_vec);
-    }
-
-    scene_vec
-}
-
 /// Merges a vec of scenes into one
 pub fn merge_scene(scene_vec: &Vec<Scene>) -> Scene {
     let mut new_scene = Scene::new();
@@ -1169,6 +1118,26 @@ mod tests {
         .into_bytes();
         for value in values {
             bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn make_multi_binary_ply(properties: &[&str], rows: &[Vec<f32>]) -> Vec<u8> {
+        assert!(rows.iter().all(|row| row.len() == properties.len()));
+
+        let mut bytes = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\n{}end_header\n",
+            rows.len(),
+            properties
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        )
+        .into_bytes();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
         bytes
     }
@@ -1269,5 +1238,109 @@ mod tests {
         };
 
         assert!(error.contains("opacity"), "{error}");
+    }
+
+    #[test]
+    fn reports_source_row_permutation_and_full_precision_canonical_state() {
+        let rows = vec![
+            vec![
+                10.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            ],
+            vec![
+                20.0,
+                0.0,
+                0.0,
+                0.4,
+                0.5,
+                0.6,
+                0.0,
+                std::f32::consts::LN_2,
+                0.0,
+                0.0,
+                2.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            vec![
+                30.0,
+                0.0,
+                0.0,
+                0.7,
+                0.8,
+                0.9,
+                4.0_f32.ln(),
+                0.0,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        ];
+
+        let parsed = Scene::from_ply_bytes_with_identity(make_multi_binary_ply(
+            &constructor_properties(),
+            &rows,
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.source_rows, vec![1, 2, 0]);
+        assert_eq!(parsed.canonical.len(), 3);
+        assert_eq!(parsed.canonical[0].position, [20.0, 0.0, 0.0]);
+        assert_eq!(
+            parsed.canonical[0].log_scale,
+            [std::f32::consts::LN_2, 0.0, 0.0]
+        );
+        assert_eq!(parsed.canonical[0].rotation, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(parsed.canonical[1].position, [30.0, 0.0, 0.0]);
+        assert_eq!(parsed.canonical[1].rotation, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(read_f32(&parsed.scene.buffer, 0), 20.0);
+    }
+
+    #[test]
+    fn equal_importance_preserves_original_source_row_order() {
+        let mut first = constructor_values().to_vec();
+        first[0] = 1.0;
+        let mut second = constructor_values().to_vec();
+        second[0] = 2.0;
+
+        let parsed = Scene::from_ply_bytes_with_identity(make_multi_binary_ply(
+            &constructor_properties(),
+            &[first, second],
+        ))
+        .unwrap();
+
+        assert_eq!(parsed.source_rows, vec![0, 1]);
+        assert_eq!(parsed.canonical[0].position[0], 1.0);
+        assert_eq!(parsed.canonical[1].position[0], 2.0);
+    }
+
+    #[test]
+    fn static_ply_packing_preserves_normalized_quaternion_sign() {
+        let properties = constructor_properties();
+        let mut values = constructor_values();
+        values[10] = -1.0;
+        let scene = Scene::from_ply_bytes(make_binary_ply(&properties, &values)).unwrap();
+        assert_eq!(scene.buffer[28], 0);
+        assert_eq!(&scene.buffer[29..32], &[127, 127, 127]);
+    }
+
+    #[test]
+    fn rejects_non_finite_required_ply_values() {
+        let mut values = constructor_values();
+        values[0] = f32::NAN;
+
+        let error = match Scene::from_ply_bytes_with_identity(make_binary_ply(
+            &constructor_properties(),
+            &values,
+        )) {
+            Ok(_) => panic!("expected non-finite input to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("non-finite"), "{error}");
+        assert!(error.contains("vertex 0"), "{error}");
     }
 }

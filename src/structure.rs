@@ -1,11 +1,26 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender},
+    },
 };
 use winit::keyboard::KeyCode;
 
 use crate::control::{CameraControl, FlyPathControl};
+use crate::motion::{MergedMotion, MotionError, MotionPlayback, TimelineSample};
+use crate::motion_behavior::{MotionAuthoringState, MotionChannelGains};
+use crate::motion_brush::{MotionBrushRuntime, MotionFieldLayout, MotionFieldQuality};
+use crate::motion_controller_palette::{
+    CompiledMotionField, MotionControllerError, MotionControllerPalette, MotionRegionDocument,
+};
+use crate::motion_graph::MotionGraph;
+use crate::motion_graph_playback::{MotionGraphPlaybackController, MotionGraphPlaybackError};
+use crate::motion_tagging::AuthoredSortMetadata;
+use crate::motion_tagging::AuthoredTagRequest;
+use crate::profiler::ProfileSnapshot;
 use crate::scene::Scene;
+use crate::scene_archive::DynamicArchiveSummary;
 use crate::skybox::SkyboxTexture;
 use crate::texture::Texture;
 use crate::utils::*;
@@ -220,6 +235,7 @@ pub struct RenderData {
     pub next_scene_data_id: Option<u32>,
     pub cur_sort_data_id: Option<u32>,
     pub next_sort_data_id: Option<u32>,
+    pub sort_revision: u64,
 
     pub frame_prev: f64,
     pub time_ma_window: usize,
@@ -228,6 +244,9 @@ pub struct RenderData {
     pub build_time_ma: IncrementalMA,
     pub sort_trigger_ma: IncrementalMA,
     pub build_trigger_ma: IncrementalMA,
+    pub profiler_enabled: bool,
+    pub profiler_reset_requested: bool,
+    pub profiler_snapshot: ProfileSnapshot,
 
     pub show_main_menu: bool,
     pub show_perf_menu: bool,
@@ -264,7 +283,366 @@ pub struct RenderData {
     pub proxy_rawtex: Option<(Vec<Vec<f32>>, Vector2<usize>)>,
 
     pub depth_texture: Option<Texture>,
+    pub motion: Option<MotionRenderData>,
 }
+
+pub struct MotionRenderData {
+    pub summary: DynamicArchiveSummary,
+    pub playback: MotionPlayback,
+    pub authoring: MotionAuthoringState,
+    pub regions: MotionRegionDocument,
+    pub local_controllers: MotionControllerPalette,
+    pub graph: Option<Arc<MotionGraph>>,
+    pub graph_error: Option<String>,
+    pub graph_playback: MotionGraphPlaybackController,
+    pub error: Option<String>,
+    pub spatial: Option<MotionBrushRuntime>,
+    pub compiled_spatial: Option<CompiledMotionField>,
+    pub spatial_error: Option<String>,
+    pub session_io: crate::motion_session::SessionIo,
+    channel_gains: MotionChannelGains,
+    observed_membership_revision: Option<u64>,
+    current_membership_request_revision: u64,
+    pending_membership_request: Option<AuthoredTagRequest>,
+}
+
+impl MotionRenderData {
+    pub fn new(
+        summary: DynamicArchiveSummary,
+        source_duration_seconds: f32,
+        graph: Option<Arc<MotionGraph>>,
+        graph_error: Option<String>,
+    ) -> Result<Self, MotionError> {
+        let regions = MotionRegionDocument::artist_defaults();
+        let mut local_controllers = MotionControllerPalette::new(source_duration_seconds)
+            .expect("MotionPlayback already validated the shared source duration");
+        local_controllers
+            .sync_root_regions(&regions)
+            .expect("artist-default Motion Regions must produce valid local controllers");
+        Ok(Self {
+            summary,
+            playback: MotionPlayback::new(source_duration_seconds)?,
+            authoring: MotionAuthoringState::default(),
+            regions,
+            local_controllers,
+            graph,
+            graph_error,
+            graph_playback: MotionGraphPlaybackController::new(source_duration_seconds, 1)
+                .expect("MotionPlayback already validated the shared source duration"),
+            error: None,
+            spatial: None,
+            compiled_spatial: None,
+            spatial_error: None,
+            session_io: crate::motion_session::SessionIo::default(),
+            channel_gains: MotionChannelGains::default(),
+            observed_membership_revision: None,
+            current_membership_request_revision: 0,
+            pending_membership_request: None,
+        })
+    }
+
+    pub fn configure_spatial_authoring(
+        &mut self,
+        user_data: &UserData,
+        center_tile: [i32; 2],
+    ) -> Result<(), String> {
+        let map_tiles = [
+            u32::try_from(user_data.tile_map_wh.x)
+                .map_err(|_| "motion field map width exceeds u32".to_string())?,
+            u32::try_from(user_data.tile_map_wh.y)
+                .map_err(|_| "motion field map height exceeds u32".to_string())?,
+        ];
+        let layout = MotionFieldLayout::new(
+            map_tiles,
+            user_data.tile_width,
+            center_tile,
+            MotionFieldQuality::Default,
+        )
+        .map_err(|error| error.to_string())?;
+        self.spatial = Some(MotionBrushRuntime::new(layout).map_err(|error| error.to_string())?);
+        self.compiled_spatial = None;
+        self.spatial_error = None;
+        self.observed_membership_revision = None;
+        self.current_membership_request_revision = 0;
+        self.pending_membership_request = None;
+        Ok(())
+    }
+
+    pub(crate) fn continue_membership_sequence(&mut self, previous: &Self) {
+        self.current_membership_request_revision = previous
+            .pending_membership_request
+            .as_ref()
+            .map(|r| r.request_revision)
+            .unwrap_or(previous.current_membership_request_revision);
+        self.observed_membership_revision = None;
+        self.pending_membership_request = None;
+    }
+
+    pub fn compile_spatial_field(&mut self) -> Result<(), MotionFrameError> {
+        self.local_controllers.sync_root_regions(&self.regions)?;
+        let Some(spatial) = self.spatial.as_ref() else {
+            self.compiled_spatial = None;
+            return Ok(());
+        };
+        if let Some(compiled) = self.compiled_spatial.as_mut() {
+            compiled.sync_roots(
+                spatial.cache(),
+                &self.regions,
+                &self.local_controllers,
+                spatial.dirty_regions(),
+            )?;
+        } else {
+            self.compiled_spatial = Some(CompiledMotionField::compile_roots(
+                spatial.cache(),
+                &self.regions,
+                &self.local_controllers,
+                None,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn take_membership_request(
+        &mut self,
+    ) -> Result<Option<AuthoredTagRequest>, MotionFrameError> {
+        if let Some(request) = &self.pending_membership_request {
+            return Ok(Some(request.clone()));
+        }
+        let (Some(spatial), Some(compiled)) = (&self.spatial, &self.compiled_spatial) else {
+            return Ok(None);
+        };
+        let membership_revision = compiled.membership_revision();
+        if self.observed_membership_revision == Some(membership_revision) {
+            return Ok(None);
+        }
+        self.observed_membership_revision = Some(membership_revision);
+        let request_revision = self.current_membership_request_revision.wrapping_add(1);
+        let snapshot = compiled.membership_snapshot(spatial.cache(), request_revision)?;
+        if self.current_membership_request_revision == 0 && !snapshot.has_authored() {
+            return Ok(None);
+        }
+        let request = AuthoredTagRequest {
+            request_revision,
+            snapshot: snapshot.has_authored().then(|| Arc::new(snapshot)),
+        };
+        self.pending_membership_request = Some(request.clone());
+        Ok(Some(request))
+    }
+
+    pub fn acknowledge_membership_request(&mut self, request_revision: u64) {
+        if self
+            .pending_membership_request
+            .as_ref()
+            .is_some_and(|request| request.request_revision == request_revision)
+        {
+            self.current_membership_request_revision = request_revision;
+            self.pending_membership_request = None;
+        }
+    }
+
+    pub const fn current_membership_request_revision(&self) -> u64 {
+        self.current_membership_request_revision
+    }
+
+    pub fn channel_gains(&self) -> MotionChannelGains {
+        self.channel_gains
+    }
+
+    pub fn apply_authoring(&mut self) -> Result<(), MotionFrameError> {
+        self.local_controllers.sync_root_regions(&self.regions)?;
+        if !self.authoring.take_dirty() {
+            return Ok(());
+        }
+
+        let behavior = self.authoring.behavior().clone();
+        let range = self.authoring.active_range().clone();
+        behavior
+            .validate()
+            .map_err(|error| MotionFrameError::Authoring(error.to_string()))?;
+        range
+            .validate()
+            .map_err(|error| MotionFrameError::Authoring(error.to_string()))?;
+
+        self.playback.set_speed(behavior.playback_speed)?;
+        self.playback.set_policy(behavior.endpoint_policy);
+        self.playback
+            .set_transition_seconds(behavior.transition_seconds)?;
+
+        let range_duration = self.playback.source_duration()
+            * (range.end_segment - range.start_segment) as f32
+            / crate::motion_graph::SOURCE_SEGMENT_COUNT as f32;
+        if behavior.endpoint_policy == crate::motion::LoopPolicy::BlendToStart {
+            let blend_window = behavior
+                .transition_seconds
+                .min(range_duration * 0.5)
+                .min(self.playback.source_duration() * 0.5);
+            self.playback.set_blend_window_seconds(blend_window)?;
+        }
+
+        let graph_config = self.graph_playback.config();
+        self.graph_playback
+            .set_enabled(behavior.stochastic_enabled && self.graph.is_some());
+        self.graph_playback
+            .set_branch_probability(behavior.branch_probability())?;
+        self.graph_playback
+            .set_transition_seconds(behavior.transition_seconds)?;
+        self.graph_playback
+            .set_minimum_dwell_segments(behavior.minimum_dwell_segments());
+        if graph_config.seed != behavior.seed {
+            self.graph_playback.set_seed(behavior.seed);
+        }
+        self.graph_playback
+            .set_source_range(range.start_segment, range.end_segment)?;
+        // Legacy session direction fields remain readable, but the unified UI has
+        // no direction control. Do not apply an invisible directional preference.
+        self.graph_playback
+            .set_direction_preference([0.0; 2], 0.0)?;
+
+        if self.channel_gains != behavior.gains {
+            self.channel_gains = behavior.gains;
+            self.playback.mark_render_dirty();
+        }
+        Ok(())
+    }
+
+    pub fn advance_local_controllers(
+        &mut self,
+        delta_seconds: f32,
+    ) -> Result<bool, MotionFrameError> {
+        let Some(graph) = self.graph.as_deref() else {
+            return Ok(false);
+        };
+        self.local_controllers.sync_root_regions(&self.regions)?;
+        self.local_controllers
+            .advance(delta_seconds, self.playback.playing, graph)?;
+        Ok(self.playback.playing || self.local_controllers.take_dirty())
+    }
+
+    pub fn restart_playback(&mut self) {
+        self.playback.restart();
+        self.graph_playback.restart();
+        self.local_controllers.restart();
+    }
+
+    pub fn sample_for_frame(
+        &mut self,
+        delta_seconds: f32,
+    ) -> Result<Option<TimelineSample>, MotionFrameError> {
+        let graph_available = self.graph.is_some();
+        if !graph_available {
+            if self.playback.take_dirty() {
+                self.playback.take_position_dirty();
+                return self
+                    .playback
+                    .sample()
+                    .map(Some)
+                    .map_err(MotionFrameError::from);
+            }
+            let sample = self.playback.advance(delta_seconds)?;
+            let changed = self.playback.take_dirty();
+            self.playback.take_position_dirty();
+            return Ok(changed.then_some(sample));
+        }
+
+        if self.playback.playing
+            && self.playback.policy == crate::motion::LoopPolicy::Hold
+            && self.graph_playback.at_active_range_end()
+        {
+            self.graph_playback.restart();
+        }
+
+        let render_controls_changed = self.playback.take_dirty();
+        let timeline_position_changed = self.playback.take_position_dirty();
+        if timeline_position_changed {
+            let source_u = match self.playback.sample()? {
+                TimelineSample::Source { u } => u,
+                TimelineSample::Blend { to_u, .. } => to_u,
+            };
+            self.graph_playback.seek_normalized(source_u)?;
+        }
+        let controls_changed = render_controls_changed | self.graph_playback.take_dirty();
+        if controls_changed {
+            let sample = self.graph_playback.sample();
+            self.sync_timeline_preview(sample);
+            return Ok(Some(sample));
+        }
+        if !self.playback.playing || delta_seconds == 0.0 {
+            return Ok(None);
+        }
+
+        let graph = self
+            .graph
+            .as_ref()
+            .expect("graph-enabled state requires an installed graph");
+        let sample = self.graph_playback.advance(
+            delta_seconds,
+            graph,
+            self.playback.policy,
+            self.playback.speed,
+            self.playback.transition_seconds,
+            self.playback.blend_window_seconds,
+        )?;
+        self.sync_timeline_preview(sample);
+        if self.playback.policy == crate::motion::LoopPolicy::Hold
+            && self.graph_playback.at_active_range_end()
+        {
+            self.playback.pause();
+        }
+        Ok(Some(sample))
+    }
+
+    fn sync_timeline_preview(&mut self, sample: TimelineSample) {
+        let u = match sample {
+            TimelineSample::Source { u } => u,
+            TimelineSample::Blend {
+                from_u,
+                to_u,
+                alpha,
+            } => from_u + (to_u - from_u) * alpha,
+        };
+        self.playback.preview_seconds = u.clamp(0.0, 1.0) * self.playback.source_duration();
+    }
+}
+
+#[derive(Debug)]
+pub enum MotionFrameError {
+    Timeline(MotionError),
+    Graph(MotionGraphPlaybackError),
+    Controller(MotionControllerError),
+    Authoring(String),
+}
+
+impl std::fmt::Display for MotionFrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeline(error) => write!(formatter, "timeline playback failed: {error}"),
+            Self::Graph(error) => write!(formatter, "motion graph playback failed: {error}"),
+            Self::Controller(error) => write!(formatter, "local motion controller failed: {error}"),
+            Self::Authoring(error) => write!(formatter, "motion authoring failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MotionFrameError {}
+
+impl From<MotionError> for MotionFrameError {
+    fn from(error: MotionError) -> Self {
+        Self::Timeline(error)
+    }
+}
+
+impl From<MotionGraphPlaybackError> for MotionFrameError {
+    fn from(error: MotionGraphPlaybackError) -> Self {
+        Self::Graph(error)
+    }
+}
+
+impl From<MotionControllerError> for MotionFrameError {
+    fn from(error: MotionControllerError) -> Self {
+        Self::Controller(error)
+    }
+}
+
 impl RenderData {
     pub fn new(max_lod_count: usize) -> Self {
         let default_ma_window: usize = 200;
@@ -278,6 +656,7 @@ impl RenderData {
             next_scene_data_id: None,
             cur_sort_data_id: None,
             next_sort_data_id: None,
+            sort_revision: 0,
 
             frame_prev: get_time_milliseconds(),
             time_ma_window: default_ma_window,
@@ -286,6 +665,9 @@ impl RenderData {
             build_time_ma: IncrementalMA::new(default_ma_window),
             sort_trigger_ma: IncrementalMA::new(default_ma_window),
             build_trigger_ma: IncrementalMA::new(default_ma_window),
+            profiler_enabled: true,
+            profiler_reset_requested: false,
+            profiler_snapshot: ProfileSnapshot::default(),
 
             show_main_menu: true,
             show_perf_menu: false,
@@ -322,6 +704,7 @@ impl RenderData {
             proxy_rawtex: None,
 
             depth_texture: None,
+            motion: None,
         }
     }
 
@@ -400,6 +783,7 @@ pub struct MainChannels {
     pub tx_vp: Sender<Mat4>,
     pub tx_build_info: Sender<(bool, Vec3)>,
     pub tx_user_data: Sender<UserData>,
+    pub tx_authored_tag_request: Sender<AuthoredTagRequest>,
 
     pub rx_user_data: Receiver<UserData>,
     pub rx_sort_data: Receiver<SortData>,
@@ -417,6 +801,7 @@ pub struct WorkerChannels {
     pub rx_vp: Receiver<Mat4>,
     pub rx_build_info: Receiver<(bool, Vec3)>,
     pub rx_user_data: Receiver<UserData>,
+    pub rx_authored_tag_request: Receiver<AuthoredTagRequest>,
 
     pub tx_user_data: Sender<UserData>,
     pub tx_sort_data: Sender<SortData>,
@@ -427,6 +812,7 @@ pub struct WorkerChannels {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum GUIStatus {
+    Unloaded,
     Config,
     PostConfig,
     Render,
@@ -490,6 +876,7 @@ pub struct SortData {
     pub scene_id: u32,
     pub tile_instance_vec: Vec<TileInstance>,
     pub render_data_vec: Vec<(RenderDataKey, Option<RenderDataValue>)>,
+    pub authored: AuthoredSortMetadata,
 }
 
 #[derive(Clone, Debug)]
@@ -693,6 +1080,27 @@ pub struct RenderDataValue {
     pub gs_lod_id: Option<Vec<u32>>,
 }
 
+impl RenderDataValue {
+    /// A cached merge can be reused by another set of visible instances.
+    /// Keep both per-splat IDs and compact draw membership in the same coordinates.
+    pub fn remap_instances(&mut self, current: &[usize]) -> Result<(), String> {
+        if self.merge_from_vec.len() != current.len() {
+            return Err("cached merge membership length mismatch".into());
+        }
+        for map_id in &mut self.gs_map_id {
+            let index = self
+                .merge_from_vec
+                .iter()
+                .position(|&id| id as u32 == *map_id)
+                .ok_or("cached Gaussian references an unknown tile instance")?;
+            *map_id = u32::try_from(current[index]).map_err(|_| "tile instance ID exceeds u32")?;
+        }
+        self.merge_from_vec.clear();
+        self.merge_from_vec.extend_from_slice(current);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct MapNeighbor {
     pub west: Option<(Vector2<usize>, usize)>, // (map_coord, which neighbor this is for that)
@@ -729,8 +1137,9 @@ impl std::ops::Index<usize> for MapNeighbor {
 }
 
 pub struct PreloadData<'a> {
-    pub tile_splats_merged: &'a Scene,
+    pub tile_splats_merged: Scene,
     pub tile_base_data: &'a mut Vec<Vec<Vec<TileBaseData>>>,
+    pub merged_motion: Option<MergedMotion>,
     // pub tile_spawning_data: &'a mut Vec<Vec<Vec<TileTransitionData>>>,
     // pub tile_changing_data: &'a mut Vec<Vec<Vec<TileTransitionData>>>,
 }

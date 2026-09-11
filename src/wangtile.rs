@@ -1,4 +1,10 @@
-use std::{collections::HashSet, f32, io::Cursor, sync::mpsc, usize};
+use std::{
+    collections::HashSet,
+    f32,
+    io::Cursor,
+    sync::{Arc, mpsc},
+    usize,
+};
 
 use cgmath::{Point3, Vector2, Vector4, perspective, prelude::*, vec2, vec3};
 use lru::LruCache;
@@ -9,11 +15,133 @@ use petgraph::{
 };
 
 use crate::log; // macro import
+use crate::motion::{MergedMotion, merge_dynamic_asset};
+use crate::motion_tagging::{AUTHORED_TAG_BIT, AuthoredOccurrenceRegistry};
 use crate::scene::*;
+use crate::scene_archive::{DynamicAsset, LoadedArchive};
 use crate::structure::*;
 use crate::utils::*;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
+
+pub(crate) fn normalize_tile_heights(
+    scenes: &mut [Vec<Scene>],
+    mut dynamic: Option<&mut DynamicAsset>,
+) -> Result<Vec<f32>, String> {
+    let tile_count = scenes
+        .first()
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "archive must contain at least one LoD and tile".to_string())?;
+    if scenes.iter().any(|lod| lod.len() != tile_count) {
+        return Err("scene grid must have the same tile count at every LoD".to_string());
+    }
+    if scenes
+        .iter()
+        .flat_map(|lod| lod.iter())
+        .any(|scene| scene.splat_count == 0)
+    {
+        return Err("tile scenes must contain at least one Gaussian".to_string());
+    }
+    if let Some(asset) = dynamic.as_ref() {
+        if asset.members.len() != scenes.len()
+            || asset.members.iter().any(|lod| lod.len() != tile_count)
+        {
+            return Err("dynamic member grid does not match the scene grid".to_string());
+        }
+        for lod in 0..scenes.len() {
+            for tile in 0..tile_count {
+                if asset.members[lod][tile].canonical.len() != scenes[lod][tile].splat_count {
+                    return Err(format!(
+                        "dynamic member row count differs at tile {tile}, LoD {lod}"
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(tile_count);
+    for tile in 0..tile_count {
+        let (_, center) = scenes[0][tile].compute_aabb_and_center();
+        let offset = -center.z;
+        for lod in 0..scenes.len() {
+            scenes[lod][tile].translate(vec3(0.0, 0.0, offset));
+            if let Some(asset) = dynamic.as_deref_mut() {
+                for canonical in &mut asset.members[lod][tile].canonical {
+                    canonical.position[2] += offset;
+                }
+            }
+        }
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+fn generate_presort_directions() -> Vec<Vec3> {
+    const RING_ELEVATIONS_DEGREES: [f32; 3] = [0.0, -30.0, -60.0];
+    const DIRECTIONS_PER_RING: usize = 8;
+
+    let mut directions = Vec::with_capacity(25);
+    for elevation_degrees in RING_ELEVATIONS_DEGREES {
+        let elevation = elevation_degrees.to_radians();
+        let horizontal_scale = elevation.cos();
+        for azimuth_index in 0..DIRECTIONS_PER_RING {
+            let azimuth = (azimuth_index as f32 * 45.0).to_radians();
+            directions.push(vec3(
+                horizontal_scale * azimuth.cos(),
+                horizontal_scale * azimuth.sin(),
+                elevation.sin(),
+            ));
+        }
+    }
+    directions.push(vec3(0.0, 0.0, -1.0));
+    directions
+}
+
+fn tag_index_stream<F>(
+    registry: &mut AuthoredOccurrenceRegistry,
+    canonical_xy: &[[f32; 2]],
+    gs_indices: &mut [u32],
+    gs_map_ids: &[u32],
+    mut occurrence: F,
+) -> Result<usize, String>
+where
+    F: FnMut(u32) -> Result<([u32; 2], [f32; 3]), String>,
+{
+    if gs_indices.len() != gs_map_ids.len() {
+        return Err("render index and map-ID streams have different lengths".to_string());
+    }
+    let mut tagged = 0;
+    for (raw_index, &map_id) in gs_indices.iter_mut().zip(gs_map_ids) {
+        if *raw_index & AUTHORED_TAG_BIT != 0 {
+            return Err("worker received an already tagged cached render index".to_string());
+        }
+        let (map_coord, occurrence_offset) = occurrence(map_id)?;
+        if let Some(encoded) = registry.tag_occurrence(
+            map_id,
+            map_coord,
+            *raw_index,
+            occurrence_offset,
+            canonical_xy,
+        )? {
+            *raw_index = encoded;
+            tagged += 1;
+        }
+    }
+    Ok(tagged)
+}
+
+fn nonmerged_render_lod(tile: &TileInstance) -> Result<usize, String> {
+    match tile.transition_status {
+        TileTransitionStatus::Changing(true) => Ok(tile.tid.0),
+        TileTransitionStatus::Changing(false) => tile
+            .tid
+            .0
+            .checked_sub(1)
+            .ok_or_else(|| "LoD transition selected a negative level".to_string()),
+        _ => Ok(tile.tid.0),
+    }
+}
 
 pub struct WangTile {
     pub user_data: UserData,
@@ -31,6 +159,9 @@ pub struct WangTile {
     rng: StdRng,
 
     tile_splats_merged: Scene,
+    dynamic_asset: Option<DynamicAsset>,
+    merged_motion: Option<MergedMotion>,
+    canonical_xy: Option<Arc<[[f32; 2]]>>,
     splats_merge_offset: Vec<Vec<u32>>, // lod, tile
     lod_avg_scale: Vec<f32>,
     tile_base_data: Vec<Vec<Vec<TileBaseData>>>, // lod, tile, view
@@ -38,10 +169,10 @@ pub struct WangTile {
     // sort_lru_cache: LRUCache<RenderDataKey, RenderDataValue, caches::DefaultHashBuilder>,
 }
 impl WangTile {
-    pub fn new(tile_splats_vec: Vec<Vec<Scene>>) -> Self {
+    pub fn new(loaded_archive: LoadedArchive) -> Result<Self, String> {
         let mut wang = Self {
             user_data: UserData::new(),
-            tile_splats_vec,
+            tile_splats_vec: loaded_archive.scenes,
             n_tiles: (0, 0, 0),
             initialized: false,
 
@@ -55,6 +186,9 @@ impl WangTile {
             rng: StdRng::seed_from_u64(0),
 
             tile_splats_merged: Scene::new(),
+            dynamic_asset: loaded_archive.dynamic,
+            merged_motion: None,
+            canonical_xy: None,
             splats_merge_offset: Vec::new(),
             lod_avg_scale: Vec::new(),
             tile_base_data: Vec::new(),
@@ -62,14 +196,22 @@ impl WangTile {
             // sort_lru_cache: LRUCache::new(1).unwrap(),
         };
         let now = get_time_milliseconds();
-        wang.preprocess();
+        wang.preprocess()?;
         log!("Wangtile preprocess: {}ms.", get_time_milliseconds() - now);
 
-        wang
+        Ok(wang)
     }
 
-    fn preprocess(&mut self) {
-        self.n_tiles = (self.tile_splats_vec.len(), self.tile_splats_vec[0].len(), 0);
+    fn preprocess(&mut self) -> Result<(), String> {
+        self.n_tiles = (
+            self.tile_splats_vec.len(),
+            self.tile_splats_vec
+                .first()
+                .map(Vec::len)
+                .ok_or_else(|| "archive must contain at least one LoD".to_string())?,
+            0,
+        );
+        normalize_tile_heights(&mut self.tile_splats_vec, self.dynamic_asset.as_mut())?;
 
         // Compute aabb & avg center
         let mut aabb_vec: Vec<(Vec3, Vec3)> = Vec::with_capacity(self.n_tiles.1);
@@ -79,15 +221,6 @@ impl WangTile {
             let mut tile_avg_center = Vec3::zero();
             let scene = &mut self.tile_splats_vec[0][tile_id];
             let (mut aabb, mut avg_center) = scene.compute_aabb_and_center();
-
-            // Height normalization
-            for lod_id in 0..self.n_tiles.0 {
-                let scene = &mut self.tile_splats_vec[lod_id][tile_id];
-                scene.translate(vec3(0.0, 0.0, -avg_center.z));
-            }
-            aabb.0.z -= avg_center.z;
-            aabb.1.z -= avg_center.z;
-            avg_center.z = 0.0;
 
             if let Some(tile_aabb_ref) = tile_aabb.as_mut() {
                 tile_aabb_ref.0 = vec3(
@@ -123,6 +256,37 @@ impl WangTile {
         }
         new_scene.generate_texture();
         self.tile_splats_merged = new_scene;
+        self.merged_motion = self
+            .dynamic_asset
+            .take()
+            .map(merge_dynamic_asset)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.canonical_xy = self
+            .merged_motion
+            .as_ref()
+            .map(|motion| {
+                if motion.canonical.len() != self.tile_splats_merged.splat_count {
+                    return Err(format!(
+                        "dynamic canonical row count {} differs from merged scene row count {}",
+                        motion.canonical.len(),
+                        self.tile_splats_merged.splat_count
+                    ));
+                }
+                if motion.canonical.len() >= AUTHORED_TAG_BIT as usize {
+                    return Err(
+                        "merged Gaussian rows exhaust the authored tag namespace".to_string()
+                    );
+                }
+                Ok(Arc::from(
+                    motion
+                        .canonical
+                        .iter()
+                        .map(|canonical| [canonical.position[0], canonical.position[1]])
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .transpose()?;
 
         // Compute avg scale
         for l in 0..self.n_tiles.0 {
@@ -143,17 +307,7 @@ impl WangTile {
 
         // Pre-sort
         let sort_projection = perspective(degrees(90.0), 1.0, 0.1, 10.0);
-        let sort_dirs = Vec::from([
-            vec3(1.0, 0.0, 0.0).normalize(),
-            vec3(-1.0, 0.0, 0.0).normalize(),
-            vec3(0.0, 1.0, 0.0).normalize(),
-            vec3(0.0, -1.0, 0.0).normalize(),
-            vec3(1.0, 0.0, -1.0).normalize(),
-            vec3(-1.0, 0.0, -1.0).normalize(),
-            vec3(0.0, 1.0, -1.0).normalize(),
-            vec3(0.0, -1.0, -1.0).normalize(),
-            vec3(0.0, 0.0, -1.0).normalize(),
-        ]);
+        let sort_dirs = generate_presort_directions();
         self.n_tiles.2 = sort_dirs.len();
         self.presort_dirs = sort_dirs;
         let mut sort_views: Vec<Mat4> = Vec::new();
@@ -252,6 +406,11 @@ impl WangTile {
                 }
             }
         }
+        // Rendering and worker updates use the merged texture plus TileBaseData;
+        // retaining every original member scene would duplicate the full archive.
+        self.tile_splats_vec.clear();
+        self.tile_splats_vec.shrink_to_fit();
+        Ok(())
     }
 
     fn compute_map_neighbors(&self, map_coord: Vector2<usize>) -> MapNeighbor {
@@ -337,10 +496,11 @@ impl WangTile {
         neighbor
     }
 
-    pub fn preload(&mut self) -> PreloadData {
+    pub fn preload(&mut self) -> PreloadData<'_> {
         PreloadData {
-            tile_splats_merged: &mut self.tile_splats_merged,
+            tile_splats_merged: std::mem::replace(&mut self.tile_splats_merged, Scene::new()),
             tile_base_data: &mut self.tile_base_data,
+            merged_motion: self.merged_motion.take(),
             // tile_spawning_data: &mut self.tile_spawning_data,
             // tile_changing_data: &mut self.tile_changing_data,
         }
@@ -473,7 +633,12 @@ impl WangTile {
         scene_data
     }
 
-    pub fn sort_tiles(&mut self, camera_pos: Vec3, view_proj: Mat4) -> SortData {
+    pub fn sort_tiles(
+        &mut self,
+        camera_pos: Vec3,
+        view_proj: Mat4,
+        authored_registry: &mut AuthoredOccurrenceRegistry,
+    ) -> Result<SortData, String> {
         // log!{"Wang thread: sort_tiles() start"};
 
         match self.user_data.merge_type {
@@ -496,6 +661,9 @@ impl WangTile {
         let mut render_data_vec: Vec<(RenderDataKey, Option<RenderDataValue>)> =
             Vec::with_capacity(tile_object_sorted.len());
         let mut tile_instance_vec: Vec<TileInstance> = Vec::with_capacity(tile_object_sorted.len());
+        let mut authored_draws = Vec::with_capacity(tile_object_sorted.len());
+        let mut tagged_occurrences = 0_usize;
+        let mut tag_time_ms = 0.0_f64;
         for mi in tile_object_sorted {
             let map_coord = self.index_to_map(mi);
             // log!{"Process {}, {:?} start", i, map_coord};
@@ -575,18 +743,13 @@ impl WangTile {
                 if self.user_data.use_cache {
                     if let Some(cache_value) = self.sort_lru_cache.get(&cache_key) {
                         let mut new_cache_value = cache_value.clone();
-                        // Update map index
-                        let mut gs_map_id = new_cache_value.gs_map_id;
-                        let merge_from_vec: &Vec<usize> = new_cache_value.merge_from_vec.as_ref();
-                        for i in 0..new_cache_value.splat_count {
-                            for j in 0..merge_from_vec.len() {
-                                if gs_map_id[i] == merge_from_vec[j] as u32 {
-                                    gs_map_id[i] = from_vec[j] as u32;
-                                    break;
-                                }
-                            }
-                        }
-                        new_cache_value.gs_map_id = gs_map_id;
+                        new_cache_value.remap_instances(from_vec)?;
+                        let tag_start = get_time_milliseconds();
+                        let tagged =
+                            self.tag_render_value(authored_registry, &mut new_cache_value)?;
+                        tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+                        tagged_occurrences += tagged;
+                        authored_draws.push(tagged != 0);
                         render_data_vec.push((cache_key, Some(new_cache_value)));
                         continue;
                     }
@@ -675,18 +838,89 @@ impl WangTile {
                 }
             }
 
+            if cache_value.is_none()
+                && authored_registry.tile_has_authored([map_coord.x as u32, map_coord.y as u32])
+                && self.canonical_xy.is_some()
+            {
+                let selected_lod = nonmerged_render_lod(&tile_instance)?;
+                let base_data = &self.tile_base_data[selected_lod][tile_instance.tid.1][view_id];
+                let mut authored_value = RenderDataValue {
+                    splat_count: base_data.splat_count,
+                    gs_index: base_data.gs_index.clone(),
+                    gs_map_id: vec![mi as u32; base_data.splat_count],
+                    merge_from_vec: vec![mi],
+                    single_lod_id: -1,
+                    gs_lod_id: Some(base_data.gs_lod_id.clone()),
+                };
+                let tag_start = get_time_milliseconds();
+                let tagged = self.tag_render_value(authored_registry, &mut authored_value)?;
+                tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+                if tagged != 0 {
+                    tagged_occurrences += tagged;
+                    cache_value = Some(authored_value);
+                }
+            }
+
+            if let Some(value) = cache_value.as_mut()
+                && matches!(tile_instance.merge_status, TileMergeStatus::MergedFrom(_))
+            {
+                let tag_start = get_time_milliseconds();
+                let tagged = self.tag_render_value(authored_registry, value)?;
+                tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+                tagged_occurrences += tagged;
+            }
+
+            authored_draws.push(cache_value.as_ref().is_some_and(|value| {
+                value
+                    .gs_index
+                    .iter()
+                    .any(|index| index & AUTHORED_TAG_BIT != 0)
+            }));
             render_data_vec.push((cache_key, cache_value));
             // log!{"Process {}, {:?} finish", i, map_coord};
         }
 
+        let authored =
+            authored_registry.finish_sort(authored_draws, tagged_occurrences, tag_time_ms)?;
         let sort_data = SortData {
             scene_id: 0,
+            authored,
             tile_instance_vec,
             render_data_vec,
         };
 
         // log!{"Wang thread: sort_tiles() finish"};
-        sort_data
+        Ok(sort_data)
+    }
+
+    fn tag_render_value(
+        &self,
+        authored_registry: &mut AuthoredOccurrenceRegistry,
+        value: &mut RenderDataValue,
+    ) -> Result<usize, String> {
+        let Some(canonical_xy) = self.canonical_xy.as_deref() else {
+            return Ok(0);
+        };
+        tag_index_stream(
+            authored_registry,
+            canonical_xy,
+            &mut value.gs_index,
+            &value.gs_map_id,
+            |map_id| {
+                let map_index = usize::try_from(map_id)
+                    .map_err(|_| "render map ID does not fit usize".to_string())?;
+                let map_coord = self.index_to_map(map_index);
+                let tile = self
+                    .tile_map
+                    .get([map_coord.x, map_coord.y])
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("render map ID {map_id} has no tile occurrence"))?;
+                Ok((
+                    [map_coord.x as u32, map_coord.y as u32],
+                    [tile.tile_offset.x, tile.tile_offset.y, tile.tile_offset.z],
+                ))
+            },
+        )
     }
 
     pub fn check_update(&self, camera_pos: &Vec3) -> bool {
@@ -1843,6 +2077,305 @@ impl WangTile {
         let edge_id = color.x * 8 + color.y * 4 + color.z * 2 + color.w;
 
         edge_id + 16 * center_idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dynamic_archive::{BasisBank, BasisBanks};
+    use crate::motion::{MergedMotionData, merge_dynamic_asset};
+    use crate::motion_tagging::{
+        AuthoredOccurrenceRegistry, AuthoredTagRequest, MotionMembershipSnapshot, RenderIndex,
+        decode_render_index,
+    };
+    use crate::scene_archive::{
+        BasisData, DynamicArchiveSummary, DynamicAsset, MemberCoefficientData, MemberMotion,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn presort_direction_bank_has_three_eight_direction_rings_and_nadir() {
+        let directions = generate_presort_directions();
+
+        assert_eq!(directions.len(), 25);
+        assert!((directions[0] - vec3(1.0, 0.0, 0.0)).magnitude() < 1.0e-6);
+        assert!((directions[8] - vec3(3.0_f32.sqrt() / 2.0, 0.0, -0.5)).magnitude() < 1.0e-6);
+        assert!((directions[16] - vec3(0.5, 0.0, -3.0_f32.sqrt() / 2.0)).magnitude() < 1.0e-6);
+        assert!((directions[24] - vec3(0.0, 0.0, -1.0)).magnitude() < 1.0e-6);
+
+        for direction in &directions {
+            assert!((direction.magnitude() - 1.0).abs() < 1.0e-6);
+            assert!(direction.z <= 1.0e-6);
+        }
+        for (index, direction) in directions.iter().enumerate() {
+            assert!(
+                directions[index + 1..]
+                    .iter()
+                    .all(|other| (*direction - *other).magnitude() > 1.0e-6)
+            );
+        }
+    }
+
+    #[test]
+    fn authored_tag_stream_changes_only_exact_indices_and_preserves_row_metadata() {
+        let snapshot = MotionMembershipSnapshot::new(
+            1,
+            1,
+            [4, 1],
+            [2, 1],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0, 0],
+            Arc::from([1_u8, 0, 1, 0]),
+            Arc::from([1_u8, 1]),
+        );
+        let mut registry = AuthoredOccurrenceRegistry::default();
+        registry
+            .reset(
+                5,
+                AuthoredTagRequest {
+                    request_revision: 1,
+                    snapshot: Some(Arc::new(snapshot)),
+                },
+            )
+            .unwrap();
+        let canonical = [[0.25, 0.25], [1.25, 0.25]];
+        let mut indices = vec![0, 1, 0];
+        let map_ids = vec![12, 12, 13];
+        let lod_ids = vec![0, 1, 0];
+
+        let tagged = tag_index_stream(
+            &mut registry,
+            &canonical,
+            &mut indices,
+            &map_ids,
+            |map_id| match map_id {
+                12 => Ok(([0, 0], [0.0, 0.0, 0.0])),
+                13 => Ok(([1, 0], [2.0, 0.0, 0.0])),
+                _ => Err("unexpected map ID".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tagged, 2);
+        assert_eq!(decode_render_index(indices[0]), RenderIndex::Authored(0));
+        assert_eq!(indices[1], 1);
+        assert_eq!(decode_render_index(indices[2]), RenderIndex::Authored(1));
+        assert_eq!(map_ids, vec![12, 12, 13]);
+        assert_eq!(lod_ids, vec![0, 1, 0]);
+        let update = registry
+            .finish_sort(vec![true], tagged, 0.0)
+            .unwrap()
+            .update
+            .unwrap();
+        assert_eq!(update.inputs[0].occurrence_offset, [0.0, 0.0, 0.0]);
+        assert_eq!(update.inputs[1].occurrence_offset, [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn authored_nonmerged_transition_tags_the_same_lod_that_renderer_draws() {
+        let mut tile = TileInstance::new();
+        tile.tid.0 = 3;
+
+        tile.transition_status = TileTransitionStatus::Changing(true);
+        assert_eq!(nonmerged_render_lod(&tile).unwrap(), 3);
+
+        tile.transition_status = TileTransitionStatus::Changing(false);
+        assert_eq!(nonmerged_render_lod(&tile).unwrap(), 2);
+
+        tile.tid.0 = 0;
+        assert!(nonmerged_render_lod(&tile).is_err());
+    }
+
+    fn scene(positions: &[[f32; 3]]) -> Scene {
+        let mut scene = Scene::new();
+        scene.splat_count = positions.len();
+        scene.buffer = vec![0_u8; positions.len() * 32];
+        for (row, position) in positions.iter().enumerate() {
+            let output = &mut scene.buffer[row * 32..(row + 1) * 32];
+            for (component, value) in position.iter().enumerate() {
+                output[component * 4..component * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for component in 0..3 {
+                output[12 + component * 4..16 + component * 4]
+                    .copy_from_slice(&1.0_f32.to_le_bytes());
+            }
+            output[28] = 255;
+            output[29..32].fill(127);
+        }
+        scene
+    }
+
+    fn member(xs: &[f32], weight_base: f32) -> MemberMotion {
+        MemberMotion {
+            canonical: xs
+                .iter()
+                .map(|x| crate::motion::CanonicalGaussian {
+                    position: [*x, 0.0, 5.0],
+                    log_scale: [0.0; 3],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                })
+                .collect(),
+            coefficients: MemberCoefficientData::Legacy {
+                basis_ids: vec![0; xs.len()],
+                weights: (0..xs.len()).map(|row| weight_base + row as f32).collect(),
+            },
+            transform_ids: vec![0; xs.len()],
+            motion_channel_masks: vec![7; xs.len()],
+        }
+    }
+
+    fn dynamic_asset() -> DynamicAsset {
+        DynamicAsset {
+            bases: BasisData::Legacy(BasisBank {
+                basis_count: 1,
+                values: vec![0.0; 75 * 9],
+            }),
+            top_k: 1,
+            source_duration_seconds: 2.0,
+            members: vec![
+                vec![member(&[0.0], 0.0), member(&[10.0, 11.0], 10.0)],
+                vec![member(&[20.0], 20.0), member(&[30.0, 31.0, 32.0], 30.0)],
+            ],
+            summary: DynamicArchiveSummary {
+                schema_version: 1,
+                tile_count: 2,
+                lod_count: 2,
+                basis_count: 1,
+                top_k: 1,
+                total_rows: 7,
+                backend: "fixture".into(),
+            },
+        }
+    }
+
+    fn v3_member(xs: &[f32], id_base: u8) -> MemberMotion {
+        let mut basis_ids = Vec::with_capacity(xs.len() * 3);
+        let mut weights = Vec::with_capacity(xs.len() * 3);
+        for row in 0..xs.len() {
+            for bank in 0..3 {
+                basis_ids.push(id_base + row as u8 + bank);
+                weights.push(id_base as f32 + 10.0 * row as f32 + bank as f32);
+            }
+        }
+        MemberMotion {
+            canonical: xs
+                .iter()
+                .map(|x| crate::motion::CanonicalGaussian {
+                    position: [*x, 0.0, 5.0],
+                    log_scale: [0.0; 3],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                })
+                .collect(),
+            coefficients: MemberCoefficientData::Separate { basis_ids, weights },
+            transform_ids: vec![0; xs.len()],
+            motion_channel_masks: vec![7; xs.len()],
+        }
+    }
+
+    fn v3_dynamic_asset() -> DynamicAsset {
+        let bank = BasisBank {
+            basis_count: 32,
+            values: vec![0.0; 32 * 75 * 3],
+        };
+        DynamicAsset {
+            bases: BasisData::Separate(BasisBanks {
+                translation: bank.clone(),
+                rotation: bank.clone(),
+                scale: bank,
+            }),
+            top_k: 1,
+            source_duration_seconds: 2.0,
+            members: vec![
+                vec![v3_member(&[0.0], 0), v3_member(&[10.0, 11.0], 10)],
+                vec![v3_member(&[20.0], 20), v3_member(&[30.0, 31.0, 32.0], 24)],
+            ],
+            summary: DynamicArchiveSummary {
+                schema_version: 3,
+                tile_count: 2,
+                lod_count: 2,
+                basis_count: 32,
+                top_k: 1,
+                total_rows: 7,
+                backend: "fixture-v3".into(),
+            },
+        }
+    }
+
+    fn read_position(scene: &Scene, row: usize) -> [f32; 3] {
+        std::array::from_fn(|component| {
+            let start = row * 32 + component * 4;
+            f32::from_le_bytes(scene.buffer[start..start + 4].try_into().unwrap())
+        })
+    }
+
+    #[test]
+    fn height_normalization_updates_static_and_canonical_positions_only() {
+        let mut scenes = vec![
+            vec![scene(&[[0.0, 0.0, 4.0], [0.0, 0.0, 6.0]])],
+            vec![scene(&[[0.0, 0.0, 8.0]])],
+        ];
+        let mut asset = dynamic_asset();
+        asset.members = vec![vec![member(&[0.0, 1.0], 0.0)], vec![member(&[2.0], 2.0)]];
+        asset.summary.tile_count = 1;
+        asset.summary.lod_count = 2;
+        asset.summary.total_rows = 3;
+        let BasisData::Legacy(basis) = &asset.bases else {
+            unreachable!()
+        };
+        let basis_before = basis.values.clone();
+
+        let offsets = normalize_tile_heights(&mut scenes, Some(&mut asset)).unwrap();
+
+        assert_eq!(offsets, vec![-5.0]);
+        assert_eq!(read_position(&scenes[0][0], 0)[2], -1.0);
+        assert_eq!(read_position(&scenes[0][0], 1)[2], 1.0);
+        assert_eq!(read_position(&scenes[1][0], 0)[2], 3.0);
+        assert_eq!(asset.members[0][0].canonical[0].position[2], 0.0);
+        assert_eq!(asset.members[1][0].canonical[0].position[2], 0.0);
+        let BasisData::Legacy(basis) = &asset.bases else {
+            unreachable!()
+        };
+        assert_eq!(basis.values, basis_before);
+    }
+
+    #[test]
+    fn merged_motion_is_lod_major_then_tile_major_with_unequal_counts() {
+        let merged = merge_dynamic_asset(dynamic_asset()).unwrap();
+        let xs = merged
+            .canonical
+            .iter()
+            .map(|canonical| canonical.position[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(xs, vec![0.0, 10.0, 11.0, 20.0, 30.0, 31.0, 32.0]);
+        let MergedMotionData::Legacy { weights, .. } = &merged.data else {
+            unreachable!()
+        };
+        assert_eq!(weights, &vec![0.0, 10.0, 11.0, 20.0, 30.0, 31.0, 32.0]);
+        assert_eq!(merged.member_offsets, vec![vec![0, 1], vec![3, 4]]);
+        assert_eq!(merged.member_counts, vec![vec![1, 2], vec![1, 3]]);
+    }
+
+    #[test]
+    fn v3_merge_is_lod_major_with_row_major_bank_major_uint8_coefficients() {
+        let merged = merge_dynamic_asset(v3_dynamic_asset()).unwrap();
+        let MergedMotionData::Separate {
+            basis_ids, weights, ..
+        } = &merged.data
+        else {
+            panic!("v3 merge must retain a separate-bank representation");
+        };
+        assert_eq!(
+            basis_ids,
+            &[
+                0_u8, 1, 2, 10, 11, 12, 11, 12, 13, 20, 21, 22, 24, 25, 26, 25, 26, 27, 26, 27, 28
+            ]
+        );
+        assert_eq!(weights.len(), 21);
+        assert_eq!(merged.member_offsets, vec![vec![0, 1], vec![3, 4]]);
+        assert_eq!(merged.member_counts, vec![vec![1, 2], vec![1, 3]]);
     }
 }
 

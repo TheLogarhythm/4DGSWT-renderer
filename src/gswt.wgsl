@@ -24,12 +24,28 @@ var s_height_map: sampler;
 @group(1) @binding(0)
 var<storage, read> u_tile_array: array<TileUniforms>;
 
+// MOTION_FIELD_BEGIN:bindings
+@group(2) @binding(0)
+var t_motion_continuous: texture_2d<f32>;
+@group(2) @binding(1)
+var t_motion_assignment: texture_2d<u32>;
+@group(2) @binding(2)
+var<uniform> u_motion_field: MotionFieldUniform;
+@group(2) @binding(3)
+var t_stable_gaussian_tex: texture_2d<u32>;
+@group(2) @binding(4)
+var t_authored_gaussian_tex: texture_2d<u32>;
+@group(2) @binding(5)
+var<storage, read> u_authored_base_rows: array<u32>;
+// MOTION_FIELD_END:bindings
+
 @vertex
 fn vs_main(
     @location(0) position: vec2<f32>,
     @location(1) gs_index: u32,
     @location(2) map_id: u32,
     @location(3) lod_id: u32,
+    @builtin(instance_index) instance_index: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
 
@@ -41,12 +57,54 @@ fn vs_main(
         return out;
     }
 
-    // 0x3ffu (1023 in decimal) masks the lower 10 bits of index
-    let u = (gs_index & 0x3ffu) << 1u;
-    let v = gs_index >> 10u;
+    var base_gs_index = gs_index;
+    // MOTION_FIELD_BEGIN:tag-decode
+    let authored_occurrence = (gs_index & 0x80000000u) != 0u;
+    let authored_output_index = gs_index & 0x7fffffffu;
+    // Tagged values are compact-output indices, not base-texture rows. Use row
+    // zero for the speculative load below and replace it immediately.
+    if authored_occurrence {
+        base_gs_index = 0u;
+    }
+    // MOTION_FIELD_END:tag-decode
 
-    let pos = textureLoad(t_gaussian_tex, vec2(u, v), 0).rgb;
+    // 0x3ffu (1023 in decimal) masks the lower 10 bits of index
+    let u = (base_gs_index & 0x3ffu) << 1u;
+    let v = base_gs_index >> 10u;
+
+    var gaussian_first = textureLoad(t_gaussian_tex, vec2(u, v), 0);
+    var gaussian_second = textureLoad(t_gaussian_tex, vec2(u | 1u, v), 0);
+    // MOTION_FIELD_BEGIN:occurrence-state
+    if authored_occurrence {
+        if u_tile.authored_tag_mode == 0u || u_motion_field.enabled == 0u {
+            let occurrence_index = u_authored_base_rows[authored_output_index];
+            let occurrence_u = (occurrence_index & 0x3ffu) << 1u;
+            let occurrence_v = occurrence_index >> 10u;
+            gaussian_first = textureLoad(t_gaussian_tex, vec2(occurrence_u, occurrence_v), 0);
+            gaussian_second = textureLoad(t_gaussian_tex, vec2(occurrence_u | 1u, occurrence_v), 0);
+        } else {
+            let occurrence_u = (authored_output_index & 0x3ffu) << 1u;
+            let occurrence_v = authored_output_index >> 10u;
+            gaussian_first = textureLoad(t_authored_gaussian_tex, vec2(occurrence_u, occurrence_v), 0);
+            gaussian_second = textureLoad(t_authored_gaussian_tex, vec2(occurrence_u | 1u, occurrence_v), 0);
+        }
+    }
+    // MOTION_FIELD_END:occurrence-state
+    let pos = gaussian_first.rgb;
     var center = bitcast<vec3<f32>>(pos); // splat pos in world space
+    // MOTION_FIELD_BEGIN:stable-center
+    var stable_local_center = center;
+    if u_motion_field.overlay_channel != 0u || u_motion_field.preview_active == 1u {
+        var stable_index = gs_index;
+        if authored_occurrence {
+            stable_index = u_authored_base_rows[authored_output_index];
+        }
+        let stable_u = (stable_index & 0x3ffu) << 1u;
+        let stable_v = stable_index >> 10u;
+        let stable_pos = textureLoad(t_stable_gaussian_tex, vec2(stable_u, stable_v), 0).rgb;
+        stable_local_center = bitcast<vec3<f32>>(stable_pos);
+    }
+    // MOTION_FIELD_END:stable-center
 
     // Offset
     var offset = u_tile.offset;
@@ -61,6 +119,27 @@ fn vs_main(
             0.0
         );
     }
+    // MOTION_FIELD_BEGIN:vertex
+    let authoring_center = stable_local_center + offset;
+    var authored_continuous = vec4(0.0, 0.5, 0.0, 1.0);
+    var authored_assignment = 0u;
+    var authoring_field_hit = false;
+    if u_motion_field.overlay_channel != 0u {
+        let field_uv = (authoring_center.xy - u_motion_field.world_origin)
+            * u_motion_field.reciprocal_world_size;
+        if all(field_uv >= vec2(0.0)) && all(field_uv < vec2(1.0)) {
+            let logical_coord = vec2<u32>(field_uv * vec2<f32>(u_motion_field.texture_size));
+            let field_coord = vec2<i32>(
+                (logical_coord + u_motion_field.storage_offset) % u_motion_field.texture_size,
+            );
+            authored_continuous = textureLoad(t_motion_continuous, field_coord, 0);
+            if u_motion_field.overlay_channel == 5u || u_motion_field.palette_count > 0u {
+                authored_assignment = textureLoad(t_motion_assignment, field_coord, 0).r;
+            }
+            authoring_field_hit = true;
+        }
+    }
+    // MOTION_FIELD_END:vertex
     center = center + offset;
     center *= u_scene.scene_scale;
     let ori_center = center;
@@ -166,7 +245,7 @@ fn vs_main(
         return out;
     }
 
-    let cov = textureLoad(t_gaussian_tex, vec2(u | 1u, v), 0);
+    let cov = gaussian_second;
     // cf. Eq.29 of https://www.cs.umd.edu/~zwicker/publications/EWASplatting-TVCG02.pdf
     let u1 = unpackHalf2x16(cov.x); // a, b
     let u2 = unpackHalf2x16(cov.y); // c, d
@@ -396,6 +475,47 @@ fn vs_main(
         }
         default: {}
     }
+    // MOTION_FIELD_BEGIN:overlay
+    if authoring_field_hit && u_motion_field.overlay_channel != 0u {
+        let overlay_color = motion_field_color(
+            u_motion_field.overlay_channel,
+            authored_continuous,
+            authored_assignment,
+        );
+        // Only tint painted locations; retain half the scene color at full influence.
+        var overlay_mix = 0.50 * clamp(authored_continuous.r, 0.0, 1.0);
+        if authored_assignment == 0u {
+            overlay_mix = 0.0;
+        }
+        debug_draw_color = vec4(
+            mix(debug_draw_color.rgb, overlay_color, overlay_mix),
+            debug_draw_color.a,
+        );
+    }
+    if u_motion_field.preview_active == 1u {
+        let preview_distance = distance(
+            authoring_center.xy,
+            u_motion_field.preview_center,
+        ) / u_motion_field.preview_radius;
+        if preview_distance <= 1.0 {
+            let preview_weight = motion_brush_preview_weight(
+                u_motion_field.preview_falloff,
+                preview_distance,
+            ) * u_motion_field.preview_opacity;
+            let preview_mix = select(0.52, 0.08, u_motion_field.overlay_channel != 0u) * preview_weight;
+            if preview_mix > 0.0 {
+            debug_draw_color = vec4(
+                mix(
+                    debug_draw_color.rgb,
+                    u_motion_field.preview_color.rgb,
+                    preview_mix,
+                ),
+                debug_draw_color.a,
+            );
+            }
+        }
+    }
+    // MOTION_FIELD_END:overlay
     vColor = debug_draw_color;
 
     // Lod transition
@@ -469,11 +589,85 @@ struct TileUniforms {
     valid_lod_id: i32,
     changing: u32,
     changing_to_lower: i32,
+    authored_tag_mode: u32,
+    padding0: u32,
 
     tile_id: vec3<u32>,
     offset: vec3<f32>,
     map_coord: vec2<u32>,
 }
+
+// MOTION_FIELD_BEGIN:definitions
+struct MotionFieldUniform {
+    world_origin: vec2<f32>,
+    reciprocal_world_size: vec2<f32>,
+    texture_size: vec2<u32>,
+    enabled: u32,
+    overlay_channel: u32,
+    palette_count: u32,
+    texels_per_tile: u32,
+    storage_offset: vec2<u32>,
+    preview_center: vec2<f32>,
+    preview_radius: f32,
+    preview_opacity: f32,
+    preview_color: vec4<f32>,
+    preview_active: u32,
+    preview_falloff: u32,
+    preview_tool: u32,
+    preview_padding: u32,
+}
+
+fn motion_brush_preview_weight(falloff: u32, normalized_distance: f32) -> f32 {
+    if normalized_distance > 1.0 {
+        return 0.0;
+    }
+    let distance = clamp(normalized_distance, 0.0, 1.0);
+    if falloff == 0u {
+        return 1.0;
+    }
+    if falloff == 1u {
+        return 1.0 - distance;
+    }
+    let distance_squared = distance * distance;
+    return 1.0 - 3.0 * distance_squared
+        + 2.0 * distance_squared * distance;
+}
+
+fn motion_field_color(
+    channel: u32,
+    continuous: vec4<f32>,
+    assignment: u32,
+) -> vec3<f32> {
+    if channel == 1u {
+        return mix(vec3(0.02, 0.04, 0.08), vec3(0.85, 1.0, 1.0), continuous.r);
+    }
+    if channel == 2u {
+        let centered = continuous.g * 2.0 - 1.0;
+        if centered < 0.0 {
+            return vec3(
+                0.2 + 0.8 * (1.0 + centered),
+                0.4 + 0.6 * (1.0 + centered),
+                1.0,
+            );
+        }
+        return vec3(1.0, 1.0 - 0.7 * centered, 1.0 - 0.8 * centered);
+    }
+    if channel == 3u {
+        return vec3(continuous.b, 0.35 * (1.0 - continuous.b), 0.9);
+    }
+    if channel == 4u {
+        return vec3(0.9 * (1.0 - continuous.a), continuous.a, 0.2);
+    }
+    if assignment == 0u {
+        return vec3(0.2);
+    }
+    return vec3(
+        f32((assignment * 97u + 53u) & 255u),
+        f32((assignment * 57u + 131u) & 255u),
+        f32((assignment * 23u + 211u) & 255u),
+    ) / 255.0;
+}
+// MOTION_FIELD_END:definitions
 
 fn halfToFloat(h: u32) -> f32 {
     let s = f32((h >> 15u) & 0x1u);

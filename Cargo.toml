@@ -35,7 +35,7 @@ rand = "0.9.2"
 regex = "1.12.2"
 rfd = "0.15.4"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
 wasm-bindgen = "0.2.104"
 wasm-bindgen-futures = "0.4.54"
 wasm_thread = { version = "0.3.3", features = ["es_modules"] }

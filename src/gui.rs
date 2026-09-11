@@ -31,6 +31,9 @@ pub struct GUI {
     config_lod_count_error_msg: Option<String>,
     config_error_msg: Option<String>,
     config_next_id: u32,
+    archive_error_msg: Option<String>,
+    archive_load_requested: bool,
+    archive_load_in_progress: bool,
 }
 
 impl GUI {
@@ -59,14 +62,38 @@ impl GUI {
             renderer: egui_renderer,
             frame_started: false,
 
-            gui_status: GUIStatus::Config,
+            gui_status: GUIStatus::Unloaded,
             config_user_data: UserData::new(),
             config_user_data_string: UserDataString::new(),
             config_confirmed: false,
             config_lod_count_error_msg: None,
             config_error_msg: None,
             config_next_id: 0,
+            archive_error_msg: None,
+            archive_load_requested: false,
+            archive_load_in_progress: false,
         }
+    }
+
+    pub fn show_archive_unloaded(&mut self, error: Option<String>) {
+        self.gui_status = GUIStatus::Unloaded;
+        self.archive_error_msg = error;
+        self.archive_load_in_progress = false;
+    }
+
+    pub fn show_archive_loading(&mut self) {
+        self.archive_error_msg = None;
+        self.archive_load_in_progress = true;
+    }
+
+    pub fn show_archive_loaded(&mut self) {
+        self.archive_error_msg = None;
+        self.archive_load_in_progress = false;
+        self.gui_status = GUIStatus::Config;
+    }
+
+    pub fn take_archive_load_request(&mut self) -> bool {
+        std::mem::take(&mut self.archive_load_requested)
     }
 
     pub fn handle_input(&mut self, window: Arc<Window>, event: &WindowEvent) {
@@ -75,12 +102,49 @@ impl GUI {
 
     pub fn render(
         &mut self,
-        channels: &mut MainChannels,
+        channels: Option<&mut MainChannels>,
         camera: &Camera,
         rd: &mut RenderData,
         fly_path_control: &mut FlyPathControl,
     ) {
+        if let Some(motion) = rd.motion.as_mut() {
+            crate::motion_session::poll(motion);
+        }
+        if self.gui_status == GUIStatus::Unloaded {
+            egui::Window::new("GSWT archive").collapsible(false).show(
+                &self.context().clone(),
+                |ui| {
+                    if self.archive_load_in_progress {
+                        ui.label("Loading and validating archive…");
+                    } else {
+                        ui.label("No GSWT archive is loaded.");
+                    }
+                    if let Some(error) = &self.archive_error_msg {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.archive_load_in_progress,
+                            egui::Button::new("Choose archive…"),
+                        )
+                        .clicked()
+                    {
+                        self.archive_load_requested = true;
+                    }
+                },
+            );
+            return;
+        }
+
+        let Some(channels) = channels else {
+            self.show_archive_unloaded(Some(
+                "Archive runtime is unavailable; choose the archive again.".to_string(),
+            ));
+            return;
+        };
+
         match self.gui_status {
+            GUIStatus::Unloaded => unreachable!("unloaded GUI returned before channel access"),
             GUIStatus::Config => {
                 self.config_lod_count_error_msg = None;
                 if self.config_lod_count_error_msg.is_none() && self.config_confirmed {
@@ -452,6 +516,10 @@ impl GUI {
                                     ));
                                     ui.end_row();
 
+                                    ui.label("Detailed profiler");
+                                    ui.checkbox(&mut rd.profiler_enabled, "Enabled");
+                                    ui.end_row();
+
                                     ui.label("Timer Avg Window");
                                     ui.add(egui::Slider::new(&mut rd.time_ma_window, 1..=5000));
                                     ui.end_row();
@@ -462,6 +530,7 @@ impl GUI {
                                         rd.build_time_ma = IncrementalMA::new(rd.time_ma_window);
                                         rd.sort_trigger_ma = IncrementalMA::new(rd.time_ma_window);
                                         rd.build_trigger_ma = IncrementalMA::new(rd.time_ma_window);
+                                        rd.profiler_reset_requested = true;
                                     }
                                     ui.end_row();
 
@@ -818,12 +887,15 @@ impl GUI {
                                 ));
                                 ui.end_row();
 
+                                render_profiler_rows(ui, rd);
+
                                 if ui.button("Reset Timer").clicked() {
                                     rd.frame_time_ma = IncrementalMA::new(rd.time_ma_window);
                                     rd.sort_time_ma = IncrementalMA::new(rd.time_ma_window);
                                     rd.build_time_ma = IncrementalMA::new(rd.time_ma_window);
                                     rd.sort_trigger_ma = IncrementalMA::new(rd.time_ma_window);
                                     rd.build_trigger_ma = IncrementalMA::new(rd.time_ma_window);
+                                    rd.profiler_reset_requested = true;
                                 }
                                 ui.end_row();
 
@@ -1067,4 +1139,146 @@ impl GUI {
 
         self.frame_started = false;
     }
+}
+
+fn render_profiler_rows(ui: &mut egui::Ui, rd: &mut RenderData) {
+    let snapshot = &rd.profiler_snapshot;
+    ui.label("Detailed profiler");
+    ui.checkbox(&mut rd.profiler_enabled, "Enabled");
+    ui.end_row();
+
+    ui.label("Timing columns");
+    ui.label("mean / p95 (ms)");
+    ui.end_row();
+
+    for (label, metric) in [
+        ("CPU frame", snapshot.frame_cpu),
+        ("CPU motion prep", snapshot.motion_cpu),
+        ("CPU render encode/upload", snapshot.render_cpu),
+        ("Worker sort", snapshot.worker_sort_cpu),
+        ("Worker build", snapshot.worker_build_cpu),
+        ("GPU motion compute", snapshot.motion_gpu),
+        ("GPU authored motion", snapshot.authored_gpu),
+        ("GPU Gaussian render", snapshot.gaussian_gpu),
+    ] {
+        ui.label(label);
+        if metric.samples == 0 {
+            ui.label("—");
+        } else {
+            ui.label(format!("{:.3} / {:.3}", metric.mean, metric.p95));
+        }
+        ui.end_row();
+    }
+
+    ui.label("GPU timestamps");
+    if let Some(error) = &snapshot.gpu_error {
+        ui.colored_label(egui::Color32::RED, error);
+    } else if snapshot.gpu_timestamps_supported {
+        ui.label("available; asynchronous readback");
+    } else {
+        ui.label("unsupported by this adapter");
+    }
+    ui.end_row();
+
+    let counters = &snapshot.counters;
+    ui.label("Archive / motion rows");
+    ui.label(format!(
+        "{} / {}",
+        counters.archive_rows.to_formatted_string(&Locale::en),
+        counters.motion_rows.to_formatted_string(&Locale::en)
+    ));
+    ui.end_row();
+
+    ui.label("Selected / rendered splats");
+    ui.label(format!(
+        "{} / {}",
+        counters.selected_splats.to_formatted_string(&Locale::en),
+        counters.rendered_splats.to_formatted_string(&Locale::en),
+    ));
+    ui.end_row();
+
+    ui.label("Blending splats");
+    ui.label(format!(
+        "{}",
+        counters.blending_splats.to_formatted_string(&Locale::en)
+    ));
+    ui.end_row();
+
+    ui.label("Active tile/LoD members");
+    ui.label(format!(
+        "{} / {}",
+        counters.active_members.to_formatted_string(&Locale::en),
+        counters.total_members.to_formatted_string(&Locale::en)
+    ));
+    ui.end_row();
+
+    ui.label("Draw calls");
+    ui.label(counters.draw_calls.to_formatted_string(&Locale::en));
+    ui.end_row();
+
+    ui.label("Uploaded per frame");
+    ui.label(format!(
+        "{:.3} MiB",
+        counters.uploaded_bytes as f64 / (1024.0 * 1024.0)
+    ));
+    ui.end_row();
+
+    ui.label("Authored registry / tagged occurrences");
+    ui.label(format!(
+        "{} / {}",
+        counters
+            .authored_registry_occurrences
+            .to_formatted_string(&Locale::en),
+        counters
+            .authored_tagged_occurrences
+            .to_formatted_string(&Locale::en)
+    ));
+    ui.end_row();
+
+    ui.label("Authored draws / worker tagging");
+    ui.label(format!(
+        "{} / {:.3} ms",
+        counters
+            .authored_affected_draws
+            .to_formatted_string(&Locale::en),
+        counters.authored_worker_tag_ms,
+    ));
+    ui.end_row();
+
+    ui.label("Membership request / registry revision");
+    ui.label(format!(
+        "{} / {}",
+        counters.authored_membership_request_revision, counters.authored_registry_revision,
+    ));
+    ui.end_row();
+
+    ui.label("Compact registry upload");
+    ui.label(format!(
+        "{:.3} KiB{}",
+        counters.authored_registry_upload_bytes as f64 / 1024.0,
+        if counters.authored_registry_installed {
+            " (installed)"
+        } else {
+            ""
+        },
+    ));
+    ui.end_row();
+
+    ui.label("Authored update");
+    ui.label(if counters.authored_dispatched {
+        "dispatched"
+    } else {
+        "idle"
+    });
+    ui.end_row();
+
+    ui.label("Motion update");
+    ui.label(if !counters.motion_dispatched {
+        "idle"
+    } else if counters.motion_blend {
+        "blend sample"
+    } else {
+        "single-source sample"
+    });
+    ui.end_row();
 }

@@ -19,6 +19,26 @@ impl Texture {
         address_mode: wgpu::AddressMode,
         label: Option<&str>,
     ) -> Result<Self> {
+        Self::empty_with_usage(
+            device,
+            img_wh,
+            format,
+            filter_mode,
+            address_mode,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label,
+        )
+    }
+
+    pub fn empty_with_usage(
+        device: &wgpu::Device,
+        img_wh: Vector2<u32>,
+        format: wgpu::TextureFormat,
+        filter_mode: wgpu::FilterMode,
+        address_mode: wgpu::AddressMode,
+        usage: wgpu::TextureUsages,
+        label: Option<&str>,
+    ) -> Result<Self> {
         let size = wgpu::Extent3d {
             width: img_wh.x,
             height: img_wh.y,
@@ -31,7 +51,7 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage,
             view_formats: &[],
         });
 
@@ -65,6 +85,35 @@ impl Texture {
         address_mode: wgpu::AddressMode,
         label: Option<&str>,
     ) -> Result<Self> {
+        Self::from_bytes_with_usage(
+            device,
+            queue,
+            bytes,
+            width,
+            height,
+            bytes_per_pixel,
+            format,
+            filter_mode,
+            address_mode,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bytes_with_usage(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        format: wgpu::TextureFormat,
+        filter_mode: wgpu::FilterMode,
+        address_mode: wgpu::AddressMode,
+        usage: wgpu::TextureUsages,
+        label: Option<&str>,
+    ) -> Result<Self> {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -77,7 +126,7 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage,
             view_formats: &[],
         });
 

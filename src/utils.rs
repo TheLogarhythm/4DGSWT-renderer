@@ -1,6 +1,11 @@
 // Partially copied from https://github.com/BladeTransformerLLC/gauzilla
 
 use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::LazyLock;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 pub use cgmath::{
@@ -29,15 +34,31 @@ pub const fn radians<T>(v: T) -> Rad<T> {
     cgmath::Rad(v)
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(module = "/src/helper.js")]
 extern "C" {
     pub fn get_time_milliseconds() -> f64;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_time_milliseconds() -> f64 {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    START.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(target_arch = "wasm32")]
 #[macro_export]
 macro_rules! log {
     ( $( $t:tt )* ) => {
         web_sys::console::log_1(&format!( $( $t )* ).into());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[macro_export]
+macro_rules! log {
+    ( $( $t:tt )* ) => {
+        log::info!( $( $t )* );
     }
 }
 
