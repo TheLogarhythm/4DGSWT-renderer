@@ -102,21 +102,158 @@ coefficient bytes per Gaussian plus the existing one-byte placement transform
 ID and one-byte mask. The mask and all three coefficient blocks follow the same
 PLY importance permutation and merge order.
 
-### Motion runtime
+After a dynamic asset is configured, **Open Motion…** in the GSWT panel opens
+one **Motion** window. It opens automatically for a newly loaded dynamic
+archive. Play/pause, restart, motion enable, scene-time scrubbing, and session
+save/load appear once in its shared header. Local styles retain independent
+timelines; the scene-time scrubber is not a local-controller scrubber.
 
-The dynamic runtime separates archive contracts, CPU reference evaluation,
-GPU reconstruction, stochastic playback, and spatial authoring state.
-`motion_behavior` defines bounded channel gains, source ranges, loop policies
-and deterministic playback parameters. Presets are direction-neutral; legacy
-session direction fields remain readable but do not bias scene or local playback.
+Choose **Scene default** to edit base motion for unpainted areas, or **Local
+styles** to edit a named local controller. Both use the same editor: **Motion
+amount**, **Speed**, and **Playback variation**. Motion amount scales all motion
+channels; it is not a brush radius or a whole-scene multiplier over local
+styles. Raising Playback variation enables stochastic branching, including
+from Subtle; zero disables it. Variation still requires eligible graph edges.
 
-`motion_brush` stores ordered strokes in absolute Wang-world XY coordinates.
-Its moving GPU cache uses 8, 16 or 32 texels per tile, with RGBA8 continuous
-parameters and R8 controller assignments. `motion_controller_palette` and
-`motion_spatial_variation` map authored regions to bounded independent timelines.
-`motion_session` provides validated sidecar serialization, loading, stroke
-history and controller-removal history without changing the source archive.
-These modules are the runtime foundation for the separate authoring interface.
+The four starting points are **Gentle**, **Steady**, **Lively**, and **Subtle**.
+Subtle is low-amplitude motion, not a freeze preset. **Motion details** holds
+XYZ translation, rotation, scale, transition duration, change frequency, seed,
+and the explicit stochastic toggle. **Source & looping** holds loop policy and
+source-range editing; the scene scope also retains its named range list.
+**Diagnostics** holds graph qualification, the scene branch trace, and field
+statistics. These sections start collapsed.
+
+In Local styles, choose **Duplicate**, adjust Motion amount, then paint the
+copy elsewhere. Duplication copies settings and source range with a new
+identity and seed; it does not copy or transform painted footprints. Changing
+a style updates all locations assigned to that style, not other styles.
+**Style options** contains rename, enable, remove, and one-level removal undo.
+Stroke undo/redo remains separate from style editing.
+
+The wind-direction pad, influence, and directional-coverage controls are
+removed. New presets are direction-neutral, and both scene and local runtime
+controllers ignore legacy directional preference fields. Old enum names and
+session fields remain readable and round-trippable; saved/custom style names
+are not forcibly renamed. This is intentionally a UI/policy change, not a
+shader, archive, or controller-capacity change.
+
+### Spatial motion brush
+
+The implementation/session names `MotionRegion`, strength, variation and
+coherence remain unchanged. Their UI names are Motion style, Motion amount,
+Spatial variety and Grouping, respectively. The technical descriptions below
+use the existing field names.
+
+Painting is embedded under **Local styles → Paint this style** in the Motion
+window. Its field is fixed in absolute Wang-world XY coordinates, while its GPU texture is
+a moving cache for the active tile window. Low, Default, and High use exactly
+8, 16, and 32 texels per Wang tile. The normal 97 by 97 Default map therefore
+uses a 1552 by 1552 cache with 0.25-world-unit texels for four-unit tiles.
+Continuous influence, strength, variation, and coherence occupy one
+`RGBA8Unorm` texture; behavior/controller identity occupies one `R8Uint`
+texture. Together they use approximately 11.5 MiB at Default quality.
+
+Choose **Paint**, aim at the `z=0` authoring plane, and paint with LMB. **Erase**
+restores scene default; **Navigate** returns camera control. Closing/collapsing
+the Motion window or switching to Scene default finishes any pending stroke
+and exits paint mode without deleting paint. **Brush size** is world-space
+diameter (twice the stored radius), not motion magnitude. The brush is a vertical
+column, so a footprint applies through the height of a plant or other exemplar.
+**More paint tools & settings** retains Motion amount, Spatial variety, Grouping,
+Synchronize, Smooth, opacity, spacing, falloff, quality and overlay controls.
+Selecting an advanced tool activates it directly; it does not require clicking
+Paint afterward. Strokes remain anchored when the active Wang
+window moves; the CPU preserves overlapping cache texels, replays the ordered
+stroke document only into newly exposed strips, and uploads those strips.
+Changing quality, moving to a non-overlapping window, or replaying a document
+that contains order-dependent Smooth strokes performs a full rebuild.
+
+The viewport shows a Blender/Houdini-style live brush preview before paint is
+applied. Its bright outer ring is the exact world-space radius, the translucent
+fill follows the selected falloff, and the inner contour marks half influence.
+A center crosshair and bounded live stroke trail improve placement. Visible
+Gaussians inside the same canonical, instance-aware XY column receive a
+tool-colored preview tint, using the same radius and falloff as rasterization.
+When the pointer cannot reach a valid part of the authoring plane, a red dashed
+cursor replaces the footprint. The preview is hidden while the pointer is over
+the UI and never writes to the authoring field by itself.
+
+The panel can overlay influence, strength, variation, coherence, or controller
+assignment. **Show painted areas** toggles the overlay; turning it off also
+disables automatic overlay following. With **Follow active paint tool**
+(default on), selecting a brush tool or dragging its Strength, Variation or
+Coherence target switches to that channel; Opacity follows Influence. The overlay
+stays selected after release. Manual overlay selection is preserved until the next
+tool/target interaction; disable Follow active paint tool to keep it fixed. These are brush
+target controls, not edits to previously painted texels or per-region motion gains.
+Lookup uses each Gaussian's canonical local position plus its
+particular occurrence offset, so deformation, camera movement, LoD changes,
+and draw sorting do not move the paint. Apply Behavior assigns the selected
+Motion Region's deterministic stochastic timeline to each affected visible
+tile occurrence. Strength blends that controller's complete translation,
+rotation, and scale result with inherited global motion. Synchronize assigns
+the selected region, clears spatial variation, and sets full coherence while
+preserving strength. Unpainted and invalid samples copy the inherited global
+result exactly. Scalar tools initialize unassigned texels with the selected
+region, so Strength, Variation, or Coherence painted on blank space affects motion.
+
+Variation chooses alternate deterministic stochastic timelines. Zero uses the
+region's root timeline; higher values select alternates in more world-space
+patches. Coherence increases patch width from one to sixteen Wang tiles in
+discrete levels; full coherence uses one shared patch throughout the region.
+It affects motion only where Variation is nonzero. Default coherence is about
+0.5; different patches may reuse a timeline. This bounded representation does
+not create a controller per texel or Gaussian. Painting can change the selected
+timeline immediately. It cannot create graph jumps, so sources with few
+eligible jumps can still produce subtle variation.
+
+Each region has one root and up to three alternate seeds, sharing a maximum of
+64 local controllers. Up to sixteen enabled regions retain all four timelines;
+additional regions reduce the variants evenly, and 64 regions leave only roots.
+The panel reports this capacity limit. Only slots used by the active painted
+field have basis data uploaded to the GPU. The same world-space position
+selects the same variant after camera movement, recentering, or quality changes.
+Region seeds, speed, TRS gains, stochastic parameters, and source range are
+editable in the shared Local styles editor and its collapsed sections;
+scene settings can be copied into a style under **Source & looping**.
+
+**Remove style** deletes the selected Motion Region/Controller and returns only its
+currently owned texels to inherited global motion. The first/default region is
+protected. Selection returns to it after removal. Freed IDs can be reused without
+reviving old paint: a document-order removal event clears the old ownership before
+later strokes replay. Other region definitions and global playback are preserved.
+**Undo removal** restores the most recent removal and its paint. Undo newer strokes
+first; subsequent region edits invalidate removal undo to avoid overwriting them.
+This is separate from the bounded internal stochastic variants of each region.
+
+### Authoring sessions and history
+
+**Save session…** downloads a `motion-session.json` sidecar containing
+global behavior/ranges, local regions and seeds, ordered absolute-world strokes,
+and brush settings/quality. **Load session…** validates the document and prepares
+replacement state before applying it. Loading restarts deterministic playback;
+it does not restore an in-progress jump or the old camera view. Play/pause,
+channel preview, and motion-enabled state remain current viewer choices.
+Overlay and Follow active paint tool also remain current viewer choices. Sessions without
+controller-removal history retain version 1; those with removal history use
+version 2, so older renderers reject them rather than replaying removals incorrectly.
+Both versions load in this renderer. Historical references to deleted regions are
+validated against later removal events; new references must identify live regions.
+
+Use the original archive and tile width. Compatibility checks cover archive
+structure, backend, source duration, and tile width, but are not a content
+fingerprint. Unsupported versions, missing region references, invalid values,
+and incompatible structures are rejected. Session input is limited to 16 MiB,
+10,000 strokes, and 200,000 path points. File cancellation and errors appear in
+the panel. File operations finish even if the panel is closed.
+
+**Undo stroke / Redo stroke** replay the ordered world-space document, including
+paint outside the GPU window. New paint clears redo. Stroke undo stops at a
+controller-removal boundary; use Undo remove there. The latest removal undo is
+viewer-local and is not restored on session load. Global/region parameter history
+and before/after comparison remain future
+work. Save before replacing a session if it needs to be kept. Long histories
+can cause a pause during replay, load, or undo. The GSWT archive stays unchanged.
 
 Authored evaluation is exact but sparse. The CPU recompiles controller
 assignments only after the field content, cache layout, or controller palette
@@ -159,6 +296,24 @@ Brush hover checks the compact contributing-tile list for each draw instead
 of scanning per-Gaussian tile IDs each frame. Cached merges remap that list
 together with their Gaussian IDs, preserving correct preview coverage.
 
+A paused control change schedules one motion update. Authoring affects both
+ordinary and blended loop evaluation without altering the archive. Loop policy
+is a preview-only choice:
+
+- **Hold** preserves the finite source interval and stops at its final state.
+- **Direct wrap** jumps from the source endpoint back to the beginning.
+- **Appended transition** preserves the source interval and appends an editable
+  smooth transition from the final state to the first.
+- **Blend ending into beginning** uses an editable final source window to
+  blend toward the first state.
+
+None of these policies modifies the archive or its authoritative non-looping
+motion. The renderer continues to sort procedural instances from canonical
+tile geometry; it does not read dynamic positions back from the GPU every
+frame. When diagnosing a possible motion-packaging error, compare the normal
+view with point-cloud visualization so canonical alpha-sort artifacts can be
+distinguished from row-identity or deformation errors.
+
 ### Stochastic motion preview
 
 For a valid dynamic archive, the renderer derives a stochastic motion graph at
@@ -183,7 +338,7 @@ Gate limits, minimum interval separation and candidate budget are configured in
 Qualified candidates receive a bounded smoothness-only probability preference
 (at most 4:1). Scene and local controllers apply no directional bias. This
 prevents large raw metric scores from making a valid alternative practically
-unreachable. Analysis summaries distinguish all close pairs, temporally
+unreachable. Advanced diagnostics distinguish all close pairs, temporally
 qualified forward/backward candidates, and retained jumps with minimum/mean/maximum
 departure-to-target gaps. Counts describe the full asset; active ranges, dwell and
 endpoint policies can reduce the jumps actually played.
@@ -203,7 +358,7 @@ several minutes in a native debug build. Visual checking is still required,
 especially for scale changes and painted motion-strength gains. No archive
 regeneration is needed; reload the asset after rebuilding the renderer.
 
-Behavior settings map variation and change frequency to deterministic
+Named behavior controls map variation and gust frequency to deterministic
 branch probability and minimum dwell. The selected graph sample reuses the
 existing WebGPU deformation path, so graph playback does not add per-frame
 graph analysis or a second motion reconstruction pass. If load-time analysis
@@ -224,6 +379,14 @@ Run the native contract, playback, and GPU tests with:
 ```powershell
 cargo test --target x86_64-pc-windows-msvc
 ```
+
+The Rust/Python parity tests use the umbrella workspace's
+`tests/fixtures/motion_parity_v1.json`, `motion_parity_v2.json`, and
+`motion_parity_v3.json`. In the normal `components/renderer` layout they are
+found automatically. For a standalone checkout or a relocated verification
+snapshot, set `FOURDGSWT_WORKSPACE_ROOT` to the umbrella directory containing
+those fixtures before running the suite. The ignored archive gate sweep is a
+separate diagnostic and is not required for ordinary test runs.
 
 The adapter-dependent parity test prints one explicit skip reason only when a
 native WebGPU adapter is unavailable. The pinned browser build remains:
@@ -250,6 +413,15 @@ busy ring drops that profiling sample instead of stalling rendering. The panel
 shows an explicit unsupported or readback-error state when GPU timings are not
 available. Profiling can be disabled in the GSWT or performance panel, and
 **Reset Timer** clears both the legacy moving averages and detailed history.
+
+For the manual authored-motion performance gate, test `flesh_eyeballs`,
+`shrub_sorrel`, and `anthurium` at 1920 by 1080 with their current default
+tile, LoD, and selective-merge settings. Use Default brush quality, set the
+diagnostic overlay to Off, and apply one Behavior stroke. Record FPS, CPU frame
+p95, GPU authored-motion p95, GPU Gaussian-render p95, candidate/painted rows,
+and affected draws. The target is at least 30 FPS on the project desktop GPU;
+this README does not treat that target as passed until the browser measurements
+have been recorded.
 
 ## Credits
 

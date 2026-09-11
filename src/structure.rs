@@ -251,6 +251,7 @@ pub struct RenderData {
     pub show_main_menu: bool,
     pub show_perf_menu: bool,
     pub show_fly_path_menu: bool,
+    pub show_motion_authoring_menu: bool,
     pub hide_menu_when_start: bool,
 
     pub camera_control_type: CameraControl,
@@ -672,6 +673,7 @@ impl RenderData {
             show_main_menu: true,
             show_perf_menu: false,
             show_fly_path_menu: false,
+            show_motion_authoring_menu: false,
             hide_menu_when_start: false,
 
             camera_control_type: CameraControl::KeyboardFly,

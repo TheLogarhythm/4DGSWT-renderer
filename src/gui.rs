@@ -143,6 +143,21 @@ impl GUI {
             return;
         };
 
+        if self.gui_status == GUIStatus::Render
+            && let Some(spatial) = rd
+                .motion
+                .as_ref()
+                .and_then(|motion| motion.spatial.as_ref())
+        {
+            let scale = rd.render_config.scene_scale;
+            crate::motion_brush_ui::paint_viewport_preview(
+                &self.context().clone(),
+                camera,
+                [scale.x, scale.y],
+                spatial,
+            );
+        }
+
         match self.gui_status {
             GUIStatus::Unloaded => unreachable!("unloaded GUI returned before channel access"),
             GUIStatus::Config => {
@@ -485,6 +500,12 @@ impl GUI {
                                 .spacing([40.0, 4.0])
                                 .striped(true)
                                 .show(ui, |ui| {
+                                    if let Some(motion) = rd.motion.as_mut() {
+                                        if render_motion_summary_controls(ui, motion) {
+                                            rd.show_motion_authoring_menu = true;
+                                        }
+                                    }
+
                                     let frame_time = rd.frame_time_ma.calc();
                                     ui.add(egui::Label::new("FPS"));
                                     ui.label(format!("{:.2}", 1000.0 / frame_time.0));
@@ -849,6 +870,15 @@ impl GUI {
                         });
                 }
 
+                if rd.show_motion_authoring_menu {
+                    let open = &mut rd.show_motion_authoring_menu;
+                    if let Some(motion) = rd.motion.as_mut() {
+                        crate::motion_authoring_ui::show(&self.context().clone(), open, motion);
+                    } else {
+                        *open = false;
+                    }
+                }
+
                 if rd.show_perf_menu {
                     egui::Window::new("Performance").show(&self.context().clone(), |ui| {
                         egui::Grid::new("performance_grid")
@@ -1138,6 +1168,66 @@ impl GUI {
         }
 
         self.frame_started = false;
+    }
+}
+
+fn render_motion_summary_controls(ui: &mut egui::Ui, motion: &mut MotionRenderData) -> bool {
+    let summary = &motion.summary;
+    ui.label("Dynamic asset");
+    ui.label(format!(
+        "v{} · {} · {} tiles × {} LoDs",
+        summary.schema_version, summary.backend, summary.tile_count, summary.lod_count
+    ));
+    ui.end_row();
+
+    ui.label("Motion");
+    ui.label(crate::motion_authoring_ui::compact_status(
+        &motion.authoring.behavior().name,
+        &motion_basis_summary(summary),
+        motion.playback.source_duration(),
+    ));
+    ui.end_row();
+
+    ui.label("Motion editing");
+    let open_authoring = ui.button("Open Motion…").clicked();
+    ui.end_row();
+
+    if let Some(error) = motion.error.as_deref() {
+        ui.label("Motion error");
+        ui.colored_label(egui::Color32::RED, error);
+        ui.end_row();
+    }
+    ui.separator();
+    ui.end_row();
+    open_authoring
+}
+
+fn motion_basis_summary(summary: &crate::scene_archive::DynamicArchiveSummary) -> String {
+    if summary.schema_version == 3 {
+        format!("3 banks · B{} · K{}", summary.basis_count, summary.top_k)
+    } else {
+        format!("{} bases · top-{}", summary.basis_count, summary.top_k)
+    }
+}
+
+#[cfg(test)]
+mod motion_summary_tests {
+    use super::motion_basis_summary;
+    use crate::scene_archive::DynamicArchiveSummary;
+
+    #[test]
+    fn version_three_summary_names_three_banks_and_compact_dimensions() {
+        let summary = DynamicArchiveSummary {
+            schema_version: 3,
+            tile_count: 4,
+            lod_count: 7,
+            basis_count: 64,
+            top_k: 8,
+            total_rows: 12_345,
+            backend: "4dgaussians".to_string(),
+        };
+
+        assert_eq!(motion_basis_summary(&summary), "3 banks · B64 · K8");
     }
 }
 

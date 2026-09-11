@@ -232,6 +232,7 @@ impl State {
                 )
                 .map_err(|error| error.to_string())?,
             );
+            render_data.show_motion_authoring_menu = true;
         }
         let (channels, worker_thread_handle) = launch_worker_thread(wang);
         self.gswt_renderer = Some(renderer);
@@ -1547,6 +1548,7 @@ mod tests {
     fn static_render_data_has_no_motion_state_or_panel_data() {
         let render_data = RenderData::new(6);
         assert!(render_data.motion.is_none());
+        assert!(!render_data.show_motion_authoring_menu);
     }
 
     #[test]
