@@ -730,6 +730,7 @@ impl RenderData {
 
 #[derive(Clone)]
 pub struct RenderConfig {
+    pub water: crate::water::WaterSettings,
     pub draw_mode: DrawMode,
     pub height_map_scale_v: f32,
     pub scene_scale: Vec3,
@@ -751,6 +752,7 @@ pub struct RenderConfig {
 impl RenderConfig {
     pub fn new(max_lod_count: usize) -> Self {
         Self {
+            water: crate::water::WaterSettings::default(),
             draw_mode: DrawMode::Normal,
             height_map_scale_v: 1.0,
             scene_scale: vec3(1.0, 1.0, 1.0),

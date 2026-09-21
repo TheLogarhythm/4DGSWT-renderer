@@ -5,6 +5,9 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) v_color: vec4<f32>,
     @location(1) v_position: vec2<f32>,
+    // WATER_BEGIN:varying
+    @location(2) water_moments: vec2<f32>,
+    // WATER_END:varying
 }
 
 @group(0) @binding(0)
@@ -531,7 +534,37 @@ fn vs_main(
 
     out.v_color = vColor;
     out.v_position = position;
+    // WATER_BEGIN:vertex
+    out.water_moments = vec2(center.z, 0.0);
+    if u_scene.water_level.y > 0.5 {
+        // Conditional world-Z distribution given the projected pixel. Packed
+        // covariance is 4*Sigma (scene.rs); recover sigma with the factor 0.5.
+        // This linearized Gaussian cut avoids whole-splat popping at the plane.
+        var cut_axis = vec3(0.0, 0.0, 1.0);
+        var cut_center = center.z;
+        if u_scene.water_waves.x > 0.0 {
+            // Curved water can intersect even a horizontal/upward view ray.
+            // Cut conditional view-depth, avoiding division by world ray Z.
+            cut_axis = -vec3(u_camera.view[0].z, u_camera.view[1].z, u_camera.view[2].z);
+            cut_center = -(u_camera.view * vec4(center, 1.0)).z;
+        }
+        let cov_cut = Vrk * cut_axis;
+        let cross_z = vec2(dot(cov_cut, T[0]), dot(cov_cut, T[1]));
+        let det = cov2d[0][0] * cov2d[1][1] - cov2d[0][1] * cov2d[0][1];
+        var conditional = vec2(0.0);
+        if det > 1e-12 {
+            conditional = vec2(
+                cov2d[1][1] * cross_z.x - cov2d[0][1] * cross_z.y,
+                cov2d[0][0] * cross_z.y - cov2d[0][1] * cross_z.x) / det;
+        }
+        let screen_delta = 0.5 * (position.x * majorAxis + position.y * minorAxis);
+        // The projection Jacobian above has the opposite sign to NDC XY.
+        let mean_z = cut_center - dot(conditional, screen_delta);
+        let sigma_z = 0.5 * sqrt(max(dot(cut_axis, cov_cut) - dot(cross_z, conditional), 1e-10));
+        out.water_moments = vec2(mean_z, sigma_z);
+    }
 
+    // WATER_END:vertex
     let vCenter = pos2d.xyz / pos2d.w;
 
     let major = (position.x*majorAxis) / u_camera.viewport;
@@ -541,28 +574,47 @@ fn vs_main(
     return out;
 }
 
-// Fragment shader
+// WATER_BEGIN:fragment
+// Fraction of a normal distribution below x (erf approximation).
+fn water_normal_cdf(x: f32) -> f32 {
+    let a = abs(x) * 0.70710678118;
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    let erf = 1.0 - polynomial * exp(-a * a);
+    return clamp(0.5 + 0.5 * sign(x) * erf, 0.0, 1.0);
+}
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> FragmentOutput {
     let A = -dot(in.v_position, in.v_position);
-    if A < -4.0 {
-        discard;
+    if A < -4.0 { discard; }
+    var B = exp(A) * in.v_color.a;
+    var depth = in.clip_position.z;
+    if u_scene.water_level.y > 0.5 {
+        let water_hit = load_water_hit(in.clip_position.xy);
+        if water_hit.y > 0.5 {
+            let side = select(-1.0, 1.0, u_camera.cam_pos.z >= u_scene.water_level.x);
+            var cut_distance = side * (in.water_moments.x - u_scene.water_level.x);
+            if u_scene.water_waves.x > 0.0 { cut_distance = water_hit.w - in.water_moments.x; }
+            B *= water_normal_cdf(cut_distance / max(in.water_moments.y, 1e-5));
+            if B < 1e-5 { discard; }
+            // Both passes read the same full-precision cached depth. Equality
+            // needs no bias, preserving occlusion by terrain in front of water.
+            depth = min(depth, water_hit.x);
+        }
     }
-    let B = exp(A) * in.v_color.a;
-    let frag_color = vec4(B * in.v_color.rgb, B);
 
-    return frag_color;
+    var out: FragmentOutput;
+    out.color = vec4(B * in.v_color.rgb, B);
+    out.depth = depth;
+    return out;
 }
 
-struct CameraUniforms {
-    projection: mat4x4<f32>,
-    view: mat4x4<f32>,
-    focal: vec2<f32>,
-    viewport: vec2<f32>,
-    htan_fov: vec2<f32>,
-    cam_pos: vec3<f32>,
-}
 
+// WATER_END:fragment
 struct SceneUniforms {
     splat_scale: f32,
     tile_width: f32,
@@ -580,6 +632,10 @@ struct SceneUniforms {
     transition_dist_vec: array<vec4<f32>, 4>,
     height_map_scale: vec3<f32>,
     scene_scale: vec3<f32>,
+    water_level: vec4<f32>,
+    water_bounds: vec4<f32>,
+    water_waves: vec4<f32>,
+    water_phases: vec4<f32>,
 }
 
 struct TileUniforms {

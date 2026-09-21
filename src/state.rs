@@ -28,6 +28,7 @@ use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
 use crate::wangtile::WangTile;
+use crate::water::WaterRenderer;
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -41,6 +42,7 @@ pub struct State {
     gswt_renderer: Option<GSWTRenderer>,
     skybox: Skybox,
     proxy: Proxy,
+    water: Option<WaterRenderer>,
 
     camera: Camera,
     keyboard_fly_control: KeyboardFlyControl,
@@ -173,6 +175,7 @@ impl State {
             gswt_renderer: None,
             skybox,
             proxy,
+            water: None,
 
             camera,
             keyboard_fly_control,
@@ -655,6 +658,18 @@ impl State {
                 let frame_delta_milliseconds = (now - rd.frame_prev).max(0.0);
                 rd.frame_time_ma.add(frame_delta_milliseconds);
                 rd.frame_prev = now;
+                if !rd.freeze_frame
+                    && rd
+                        .render_config
+                        .water
+                        .is_active(self.gui.config_user_data.surface_type)
+                {
+                    rd.render_config
+                        .water
+                        .advance(frame_delta_milliseconds / 1000.0);
+                } else if rd.freeze_frame && rd.step_frame {
+                    rd.render_config.water.advance(1.0 / 60.0);
+                }
 
                 if let Some(motion) = rd.motion.as_mut() {
                     let motion_cpu_start = get_time_milliseconds();
@@ -984,9 +999,30 @@ impl State {
                 {
                     rd.step_frame = false;
 
+                    let water_active = rd
+                        .render_config
+                        .water
+                        .is_active(self.gui.config_user_data.surface_type);
                     if rd.use_skybox {
                         self.skybox
                             .render(&self.queue, &mut encoder, &view, &self.camera);
+                    } else {
+                        // No sky was drawn: initialize uncovered pixels as well as the water area.
+                        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Scene background clear"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
                     }
 
                     if rd.use_proxy {
@@ -994,6 +1030,32 @@ impl State {
                             .render(&self.queue, &mut encoder, &view, &self.camera, rd);
                     }
 
+                    let water_drawn = if water_active {
+                        self.water
+                            .get_or_insert_with(|| {
+                                WaterRenderer::new(&self.device, self.config.format)
+                            })
+                            .render(
+                                &self.device,
+                                &self.queue,
+                                &mut encoder,
+                                &view,
+                                &self.camera,
+                                &self.gui.config_user_data,
+                                rd,
+                                self.skybox
+                                    .water_environment
+                                    .as_ref()
+                                    .filter(|_| rd.use_skybox),
+                                self.profiler.water_timestamp_writes(),
+                            )
+                    } else {
+                        false
+                    };
+
+                    if water_active && !water_drawn {
+                        self.profiler.cancel_water_timestamp();
+                    }
                     if rd.render_gs {
                         let render_cpu_start = get_time_milliseconds();
                         let timestamp_writes = self.profiler.render_timestamp_writes();
@@ -1003,6 +1065,12 @@ impl State {
                             &view,
                             &self.camera,
                             rd,
+                            rd.use_proxy || water_drawn,
+                            self.water
+                                .as_ref()
+                                .and_then(|w| w.hits())
+                                .filter(|_| water_drawn)
+                                .map(|h| &h.read),
                             timestamp_writes,
                         );
                         self.profiler.counters_mut().merge_render_work(work);

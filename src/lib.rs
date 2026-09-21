@@ -33,6 +33,13 @@ mod structure;
 mod texture;
 mod utils;
 mod wangtile;
+mod water;
+mod water_environment;
+mod water_hits;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod test_support;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod water_tests;
 
 use app::App;
 

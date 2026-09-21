@@ -3,14 +3,22 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
 };
 
-const GPU_QUERY_COUNT: u32 = 6;
+const GPU_QUERY_COUNT: u32 = 10;
 const GPU_TIMESTAMP_BYTES: u64 = GPU_QUERY_COUNT as u64 * std::mem::size_of::<u64>() as u64;
 const GPU_TIMESTAMP_PAIR_BYTES: u64 = 2 * std::mem::size_of::<u64>() as u64;
 const MOTION_RESOLVE_OFFSET: u64 = 0;
 const AUTHORED_RESOLVE_OFFSET: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
 const RENDER_RESOLVE_OFFSET: u64 = 2 * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
-const GPU_RESOLVE_BUFFER_BYTES: u64 = RENDER_RESOLVE_OFFSET + GPU_TIMESTAMP_PAIR_BYTES;
+const WATER_HIT_RESOLVE_OFFSET: u64 = 3 * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+const WATER_SHADE_RESOLVE_OFFSET: u64 = 4 * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+const GPU_RESOLVE_BUFFER_BYTES: u64 = WATER_SHADE_RESOLVE_OFFSET + GPU_TIMESTAMP_PAIR_BYTES;
 const READBACK_RING_SIZE: usize = 4;
+
+#[derive(Default)]
+pub(crate) struct WaterPassTimestamps<'a> {
+    pub intersection: Option<wgpu::ComputePassTimestampWrites<'a>>,
+    pub shading: Option<wgpu::RenderPassTimestampWrites<'a>>,
+}
 
 pub fn renderer_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
     let mut required = wgpu::Features::FLOAT32_FILTERABLE;
@@ -178,6 +186,8 @@ pub struct GpuTimingSample {
     pub motion: Option<(u64, u64)>,
     pub authored: Option<(u64, u64)>,
     pub render: Option<(u64, u64)>,
+    pub water_hit: Option<(u64, u64)>,
+    pub water_shade: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,6 +195,7 @@ struct TimestampPasses {
     motion: bool,
     authored: bool,
     render: bool,
+    water: bool,
 }
 
 fn decode_timestamp_words(
@@ -195,6 +206,8 @@ fn decode_timestamp_words(
         motion: passes.motion.then_some((words[0], words[1])),
         authored: passes.authored.then_some((words[2], words[3])),
         render: passes.render.then_some((words[4], words[5])),
+        water_hit: passes.water.then_some((words[6], words[7])),
+        water_shade: passes.water.then_some((words[8], words[9])),
     }
 }
 
@@ -209,6 +222,8 @@ pub struct ProfileSnapshot {
     pub motion_gpu: MetricSummary,
     pub authored_gpu: MetricSummary,
     pub gaussian_gpu: MetricSummary,
+    pub water_hit_gpu: MetricSummary,
+    pub water_shade_gpu: MetricSummary,
     pub counters: FrameCounters,
     pub gpu_timestamps_supported: bool,
     pub gpu_error: Option<String>,
@@ -224,6 +239,8 @@ pub struct ProfileHistory {
     motion_gpu: MetricSeries,
     authored_gpu: MetricSeries,
     gaussian_gpu: MetricSeries,
+    water_hit_gpu: MetricSeries,
+    water_shade_gpu: MetricSeries,
 }
 
 #[derive(Debug)]
@@ -344,6 +361,25 @@ impl GpuProfiler {
         })
     }
 
+    fn water_timestamp_writes(&mut self) -> WaterPassTimestamps<'_> {
+        if self.current_slot.is_none() {
+            return WaterPassTimestamps::default();
+        }
+        self.current_passes.water = true;
+        WaterPassTimestamps {
+            intersection: Some(wgpu::ComputePassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(6),
+                end_of_pass_write_index: Some(7),
+            }),
+            shading: Some(wgpu::RenderPassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(8),
+                end_of_pass_write_index: Some(9),
+            }),
+        }
+    }
+
     fn cancel_motion_timestamp(&mut self) {
         self.current_passes.motion = false;
     }
@@ -359,9 +395,29 @@ impl GpuProfiler {
         if !self.current_passes.motion
             && !self.current_passes.authored
             && !self.current_passes.render
+            && !self.current_passes.water
         {
             self.slots.release(slot);
             return;
+        }
+        if self.current_passes.water {
+            for (range, offset, destination) in [
+                (6..8, WATER_HIT_RESOLVE_OFFSET, 3 * GPU_TIMESTAMP_PAIR_BYTES),
+                (
+                    8..10,
+                    WATER_SHADE_RESOLVE_OFFSET,
+                    4 * GPU_TIMESTAMP_PAIR_BYTES,
+                ),
+            ] {
+                encoder.resolve_query_set(&self.query_set, range, &self.resolve_buffer, offset);
+                encoder.copy_buffer_to_buffer(
+                    &self.resolve_buffer,
+                    offset,
+                    &self.readback_buffers[slot],
+                    destination,
+                    GPU_TIMESTAMP_PAIR_BYTES,
+                );
+            }
         }
         if self.current_passes.motion {
             encoder.resolve_query_set(
@@ -500,6 +556,22 @@ impl FrameProfiler {
             .flatten()
     }
 
+    pub fn water_timestamp_writes(&mut self) -> WaterPassTimestamps<'_> {
+        if !self.enabled {
+            return WaterPassTimestamps::default();
+        }
+        self.gpu
+            .as_mut()
+            .map_or_else(WaterPassTimestamps::default, |gpu| {
+                gpu.water_timestamp_writes()
+            })
+    }
+    pub fn cancel_water_timestamp(&mut self) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.current_passes.water = false;
+        }
+    }
+
     pub fn cancel_motion_timestamp(&mut self) {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.cancel_motion_timestamp();
@@ -583,6 +655,8 @@ impl ProfileHistory {
             motion_gpu: MetricSeries::new(window),
             authored_gpu: MetricSeries::new(window),
             gaussian_gpu: MetricSeries::new(window),
+            water_hit_gpu: MetricSeries::new(window),
+            water_shade_gpu: MetricSeries::new(window),
         }
     }
 
@@ -607,6 +681,16 @@ impl ProfileHistory {
     }
 
     pub fn record_gpu(&mut self, sample: GpuTimingSample, period_nanoseconds: f32) {
+        for (sample, series) in [
+            (sample.water_hit, &mut self.water_hit_gpu),
+            (sample.water_shade, &mut self.water_shade_gpu),
+        ] {
+            if let Some((start, end)) = sample {
+                if let Some(ms) = duration_milliseconds(start, end, period_nanoseconds) {
+                    series.add(ms);
+                }
+            }
+        }
         if let Some((start, end)) = sample.motion {
             if let Some(milliseconds) = duration_milliseconds(start, end, period_nanoseconds) {
                 self.motion_gpu.add(milliseconds);
@@ -634,6 +718,8 @@ impl ProfileHistory {
             motion_gpu: self.motion_gpu.summary(),
             authored_gpu: self.authored_gpu.summary(),
             gaussian_gpu: self.gaussian_gpu.summary(),
+            water_hit_gpu: self.water_hit_gpu.summary(),
+            water_shade_gpu: self.water_shade_gpu.summary(),
             ..ProfileSnapshot::default()
         }
     }
@@ -648,6 +734,8 @@ impl ProfileHistory {
             &mut self.motion_gpu,
             &mut self.authored_gpu,
             &mut self.gaussian_gpu,
+            &mut self.water_hit_gpu,
+            &mut self.water_shade_gpu,
         ] {
             series.values.clear();
         }
@@ -755,6 +843,8 @@ mod tests {
                 motion: Some((100, 600)),
                 authored: Some((700, 1200)),
                 render: Some((1300, 2300)),
+                water_hit: Some((2400, 3400)),
+                water_shade: Some((3500, 3750)),
             },
             2.0,
         );
@@ -766,6 +856,8 @@ mod tests {
         assert_eq!(snapshot.motion_gpu.mean, 0.001);
         assert_eq!(snapshot.authored_gpu.mean, 0.001);
         assert_eq!(snapshot.gaussian_gpu.mean, 0.002);
+        assert_eq!(snapshot.water_hit_gpu.mean, 0.002);
+        assert_eq!(snapshot.water_shade_gpu.mean, 0.0005);
     }
 
     #[test]
@@ -776,12 +868,15 @@ mod tests {
                 motion: None,
                 authored: None,
                 render: Some((5, 10)),
+                ..Default::default()
             },
             1.0,
         );
 
         let snapshot = history.snapshot();
         assert_eq!(snapshot.motion_gpu.samples, 0);
+        assert_eq!(snapshot.water_hit_gpu.samples, 0);
+        assert_eq!(snapshot.water_shade_gpu.samples, 0);
         assert_eq!(snapshot.authored_gpu.samples, 0);
         assert_eq!(snapshot.gaussian_gpu.samples, 1);
     }
@@ -810,32 +905,38 @@ mod tests {
     #[test]
     fn timestamp_decoder_omits_passes_that_were_not_written() {
         let sample = decode_timestamp_words(
-            [10, 20, 30, 50, 80, 120],
+            [10, 20, 30, 50, 80, 120, 140, 180, 200, 220],
             TimestampPasses {
                 motion: true,
                 authored: true,
                 render: false,
+                water: false,
             },
         );
         assert_eq!(sample.motion, Some((10, 20)));
         assert_eq!(sample.authored, Some((30, 50)));
         assert_eq!(sample.render, None);
+        assert_eq!(sample.water_hit, None);
+        assert_eq!(sample.water_shade, None);
     }
 
     #[test]
     fn timestamp_decoder_keeps_global_authored_and_render_pairs_independent() {
         let sample = decode_timestamp_words(
-            [10, 20, 30, 50, 80, 120],
+            [10, 20, 30, 50, 80, 120, 140, 180, 200, 220],
             TimestampPasses {
                 motion: true,
                 authored: true,
                 render: true,
+                water: true,
             },
         );
 
         assert_eq!(sample.motion, Some((10, 20)));
         assert_eq!(sample.authored, Some((30, 50)));
         assert_eq!(sample.render, Some((80, 120)));
+        assert_eq!(sample.water_hit, Some((140, 180)));
+        assert_eq!(sample.water_shade, Some((200, 220)));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -872,6 +973,7 @@ mod tests {
         assert!(profiler.motion_timestamp_writes().is_some());
         assert!(profiler.authored_timestamp_writes().is_some());
         assert!(profiler.render_timestamp_writes().is_some());
+        assert!(profiler.water_timestamp_writes().intersection.is_some());
 
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

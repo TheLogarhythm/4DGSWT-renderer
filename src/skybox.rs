@@ -30,6 +30,7 @@ pub struct Skybox {
     equi_bind_group_layout: wgpu::BindGroupLayout,
 
     is_equi: bool,
+    pub(crate) water_environment: Option<crate::water_environment::WaterEnvironment>,
 }
 impl Skybox {
     const CUBEMAP_RESO: u32 = 2048; // Choose a resolution for each face
@@ -335,6 +336,7 @@ impl Skybox {
             equi_bind_group_layout,
 
             is_equi: false,
+            water_environment: None,
         }
     }
 
@@ -450,6 +452,12 @@ impl Skybox {
             label: Some("Skybox skybox_bind_group"),
         });
 
+        self.water_environment = Some(crate::water_environment::WaterEnvironment::from_sky(
+            device,
+            queue,
+            &skybox_texture,
+            self.is_equi,
+        ));
         self.skybox_texture = Some(skybox_texture);
         self.skybox_texture_bind_group = Some(skybox_texture_bind_group);
     }

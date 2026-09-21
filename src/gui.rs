@@ -673,6 +673,60 @@ impl GUI {
                                         ui.end_row();
                                     }
 
+                                    ui.collapsing("Water", |ui| {
+                                        let supported = self.config_user_data.surface_type != SurfaceType::Sphere;
+                                        ui.add_enabled_ui(supported, |ui| {
+                                            let water = &mut rd.render_config.water;
+                                            ui.checkbox(&mut water.enabled, "Enable water");
+                                            ui.add_enabled_ui(water.enabled, |ui| {
+                                                egui::Grid::new("water_controls").num_columns(2).show(ui, |ui| {
+                                                    ui.label("Water level");
+                                                    ui.add(egui::DragValue::new(&mut water.height).speed(0.02).range(-10000.0..=10000.0))
+                                                        .on_hover_text("Height in renderer world coordinates");
+                                                    ui.end_row();
+                                                    ui.label("Water color");
+                                                    ui.color_edit_button_rgb(&mut water.color);
+                                                    ui.end_row();
+                                                    ui.label("Wave amplitude");
+                                                    ui.add(egui::Slider::new(&mut water.amplitude, 0.0..=water.wavelength * 0.035).max_decimals(3))
+                                                        .on_hover_text("Maximum displacement from the mean water level. Zero gives a flat surface.");
+                                                    ui.end_row();
+                                                    ui.label("Wavelength");
+                                                    if ui.add(egui::DragValue::new(&mut water.wavelength).speed(0.05).range(0.1..=1000.0)).changed() {
+                                                        water.amplitude = water.amplitude.min(water.wavelength * 0.035);
+                                                    }
+                                                    ui.end_row();
+                                                    ui.label("Wave variation");
+                                                    ui.checkbox(&mut water.varied_waves, "Irregular directions and spacing");
+                                                    ui.end_row();
+                                                    ui.label("Reflection strength");
+                                                    ui.add(egui::Slider::new(&mut water.reflection_strength, 0.0..=1.0))
+                                                        .on_hover_text("Reflects the displayed skybox. Zero disables reflection.");
+                                                    ui.end_row();
+                                                    ui.label("Roughness");
+                                                    ui.add(egui::Slider::new(&mut water.roughness, 0.0..=1.0));
+                                                    ui.end_row();
+                                                    ui.label("Ripple strength");
+                                                    ui.add(egui::Slider::new(&mut water.ripple_strength, 0.0..=1.0))
+                                                        .on_hover_text("Fine surface detail. Zero disables ripples.");
+                                                    ui.end_row();
+                                                    ui.label("Ripple scale");
+                                                    ui.add(egui::DragValue::new(&mut water.ripple_scale).speed(0.01).range(0.02..=100.0));
+                                                    ui.end_row();
+                                                    ui.label("Wave speed");
+                                                    ui.add(egui::Slider::new(&mut water.speed, 0.0..=5.0));
+                                                    ui.end_row();
+                                                    ui.label("Wave playback");
+                                                    ui.checkbox(&mut water.playing, "Playing");
+                                                    ui.end_row();
+                                                });
+                                            });
+                                        });
+                                        if rd.render_config.water.enabled && !rd.use_skybox { ui.label("Load and enable a skybox for environment reflection."); }
+                                        if !supported { ui.label("Water is available with None or HeightMap surface mapping."); }
+                                    });
+                                    ui.end_row();
+
                                     ui.label("Clip By Z");
                                     ui.checkbox(&mut rd.render_config.use_clip, "");
                                     ui.end_row();
@@ -1250,6 +1304,8 @@ fn render_profiler_rows(ui: &mut egui::Ui, rd: &mut RenderData) {
         ("GPU motion compute", snapshot.motion_gpu),
         ("GPU authored motion", snapshot.authored_gpu),
         ("GPU Gaussian render", snapshot.gaussian_gpu),
+        ("GPU water intersection", snapshot.water_hit_gpu),
+        ("GPU water shading", snapshot.water_shade_gpu),
     ] {
         ui.label(label);
         if metric.samples == 0 {

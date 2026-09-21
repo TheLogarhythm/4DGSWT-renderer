@@ -395,12 +395,110 @@ native WebGPU adapter is unavailable. The pinned browser build remains:
 wasm-pack build --target web
 ```
 
+## Water
+
+In the rendering menu, expand **Water** and enable **Enable water**. Controls update live:
+
+- **Water level / color**: mean height in final renderer world Z, and opaque base color.
+- **Wave amplitude / wavelength**: geometric displacement and world-space scale (defaults 0.08 and 4.0). Amplitude zero makes the geometry flat.
+- **Wave variation**: uses four fixed, irregular directions and wavelength ratios. Turn off to compare the previous three-wave pattern.
+- **Reflection strength**: Fresnel-weighted reflection of the currently displayed skybox (default 1, zero disables it). Load and enable a skybox to see reflection.
+- **Roughness**: blurs the environment reflection (default 0.18).
+- **Ripple strength / scale**: small animated normal detail, independent of geometric displacement (defaults 0.22 and 0.35 world units). Strength zero disables it.
+- **Wave speed / Playing**: control the shared wave and ripple clock. Zero speed holds the current phase; pause is independent of GS motion.
+
+Water starts disabled. Amplitude is limited to 3.5% of the primary wavelength.
+Its mean level stays fixed when the camera moves, tiles stream, or scene Z scale
+changes. Archive preprocessing can shift source coordinates, so Blender's
+waterline Z is not automatically the renderer's water level.
+
+One continuous surface covers the committed tile window plus a one-tile border,
+including gaps within and between tiles. Coverage is finite. **None** and
+**HeightMap** mapping are supported; Sphere disables water. Streaming does not
+reset world-space wave or ripple phase. Speed changes affect future time only.
+Global Freeze holds the clock; Step advances by 1/60 second when playback is on.
+
+Water intersections are computed once per screen pixel each frame into an RG32Float
+texture (depth and positive view distance, approximately 15.8 MiB at 1920x1080).
+Water shading and all GS layers use exact texel loads from the same result. The
+intersection pass is independent of proxy depth; misses are overwritten and the
+texture is recreated on viewport resize. Dry GS pipelines compile without water
+cut moments, the intersection solver or fragment-depth output.
+
+Dynamic GS is
+clipped against the current wave surface using a conditional view-depth Gaussian
+distribution. This is a Gaussian approximation, not a reconstructed mesh shoreline.
+Fine ripples affect only lighting, so they cannot move the waterline. Both ripple
+and wave lighting normals are filtered when smaller than a pixel.
+
+Reflection uses a 256-pixel cubemap with nine GGX-prefiltered roughness levels
+(about 4 MiB), generated when a skybox is configured. Filtering/blending uses
+linear color decoded from the existing displayed skybox; HDR sky color has already
+been tone mapped by the skybox renderer. The pass is an economical environment
+reflection approximation. It does not render GS object reflections, transmission,
+refraction or foam. Disabling the displayed sky also disables its reflection.
+
+For a stage-2 comparison, set reflection and ripple strengths to zero and turn off
+wave variation. Set amplitude to zero as well to restore stage-1 pixels.
+The geometric solver uses conservative first- and second-derivative bounds and
+an adaptive iteration budget. Its 16,384-step cap is finite; extreme grazing views,
+large coverage and short waves can cost more or reach that cap.
+
+Native GPU acceptance includes coverage, GS contact and proxy depth, motion and
+clock controls, environment replacement, cubemap/HDRI orientation, Fresnel angle
+response, roughness, detail-only contact preservation and subpixel filtering.
+Intersection tests compare 2,048 GPU rays (both spectra) with an independent dense
+CPU reference, plus two short-wave grazing regressions. Cache tests cover camera/phase
+changes, resizing, miss overwrite, and flat-water edge derivative preservation.
+
+```powershell
+cargo test --offline --target x86_64-pc-windows-msvc --lib water_ -- --test-threads=1
+```
+
+For real-scene review, set `WATER_REVIEW_ARCHIVE` to a local tile ZIP containing
+`tile0_lod1.ply`, `WATER_REVIEW_SKY` to a local EXR, and `WATER_REVIEW_DIR` to an
+output directory, then run:
+
+```powershell
+cargo test --offline --target x86_64-pc-windows-msvc --lib water_export_review_frames -- --ignored --nocapture
+```
+
+This exports static levels, animated Flowers contact, and low-angle open-water
+comparisons. It reports GPU timestamp median/p95 for the previous material,
+reflection alone, and the full material. Timings include clear, sky, water and GS;
+they exclude CPU work, readback and UI. The fixture uses one 29,279-splat Flowers
+tile at 768×768, with 30 samples after five warm-up frames. It is a native offscreen
+measurement, not full-world browser FPS. The iceberg GS archive still needs
+scene-specific acceptance when available.
+
+For the dense 1080p performance comparison, set `WATER_PERF_ARCHIVE` to a local
+shrub_sorrel tile ZIP and `WATER_PERF_DIR` to the output directory, then run:
+
+```powershell
+cargo test --offline --target x86_64-pc-windows-msvc water_dense_shrub_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+This benchmark renders 25 copies of the canonical LoD0 tile from a fixed camera.
+It measures dry, flat, wave-only and full-material configurations with GPU timestamps,
+and exports images plus `timings.json` (including intersection, material and GS timings).
+It does not measure the browser, sorting, dynamic-motion compute or full-world FPS.
+Run GPU benchmarks separately from other GPU tests and close previous native test
+executables before relinking on Windows.
+See [water performance validation](docs/water-performance.md) for the measured
+comparison and its scope.
+
+Build the browser package with **Binaryen 132**: put its `bin` directory first
+on the current shell's `PATH`, verify `wasm-opt --version`, then run
+`wasm-pack build --target web`. Confirm that the build log reports that executable.
+The older bundled Binaryen 117 aborts in its Precompute pass on this project.
+
 ## Performance profiling
 
 Press **P** during rendering to open the performance panel. The detailed
 profiler reports rolling mean and p95 timings for the CPU frame, motion
 preparation, Gaussian render encoding/uploads, worker sort/build work, GPU
-global motion compute, GPU authored motion compute, and GPU Gaussian rendering.
+global motion compute, GPU authored motion compute, GPU Gaussian rendering,
+GPU water intersection and GPU water shading.
 It also reports the current archive/motion row counts, selected and rendered
 splats, blending splats, active tile/LoD members, draw calls, bytes uploaded per
 frame, compact registry and tagged-rendered occurrence counts, affected draws,
