@@ -107,7 +107,10 @@ impl ApplicationHandler<State> for App {
         state.handle_gui(&event);
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                state.stop_worker();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 state.update();

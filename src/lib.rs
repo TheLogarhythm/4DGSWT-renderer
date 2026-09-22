@@ -1,3 +1,5 @@
+#![cfg_attr(target_arch = "wasm32", feature(stdarch_wasm_atomic_wait))]
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use winit::event_loop::EventLoop;
@@ -20,6 +22,7 @@ mod motion_graph;
 mod motion_graph_analysis;
 mod motion_graph_playback;
 mod motion_session;
+mod motion_shader;
 mod motion_spatial_variation;
 mod motion_tagging;
 mod profiler;
@@ -40,6 +43,7 @@ mod water_hits;
 mod test_support;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod water_tests;
+mod worker;
 
 use app::App;
 

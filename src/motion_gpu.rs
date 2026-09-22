@@ -750,7 +750,9 @@ impl GpuMotionRuntime {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Dynamic Motion Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("motion_compute.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::motion_shader::source(include_str!("motion_compute.wgsl")).into(),
+            ),
         });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Dynamic Motion Compute Pipeline"),
@@ -1295,6 +1297,9 @@ fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEn
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::test_support::gpu::{GpuTestContext, MissingGpu, read_buffer, read_texture_bytes};
+
     use super::*;
     use crate::dynamic_archive::{BasisBank, BasisBanks};
     use crate::motion::{
@@ -1550,19 +1555,19 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_three_bank_reconstruction_matches_cpu_for_source_blend_and_masks() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("three-bank GPU parity test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
+        let Some(GpuTestContext {
+            device,
+            queue,
+            adapter,
+        }) = GpuTestContext::new(
+            "three-bank motion parity device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        )
+        else {
+            return;
+        };
         let format_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba32Uint);
         if !format_features
             .allowed_usages
@@ -1573,15 +1578,6 @@ mod tests {
             );
             return;
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("three-bank motion parity device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
 
         let make_bank = |bank_offset: f32| {
             let mut values = Vec::with_capacity(2 * 75 * 3);
@@ -1730,19 +1726,19 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_reconstruction_matches_cpu_for_zero_rigid_mixed_and_blended_motion() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("GPU parity test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
+        let Some(GpuTestContext {
+            device,
+            queue,
+            adapter,
+        }) = GpuTestContext::new(
+            "motion parity device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        )
+        else {
+            return;
+        };
         let format_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba32Uint);
         if !format_features
             .allowed_usages
@@ -1751,15 +1747,6 @@ mod tests {
             eprintln!("GPU parity test skipped: adapter lacks rgba32uint storage textures");
             return;
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("motion parity device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
 
         let mut basis_values = Vec::with_capacity(7 * 75 * 9);
         for basis in 0..7 {
@@ -2219,32 +2206,15 @@ mod tests {
                 Some(row),
             )
             .unwrap();
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("motion state parity readback"),
-            size: std::mem::size_of::<MotionStateGpu>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(
+        queue.submit(Some(encoder.finish()));
+        let bytes = read_buffer(
+            device,
+            queue,
             runtime.diagnostic_buffer(),
-            0,
-            &readback,
             0,
             std::mem::size_of::<MotionStateGpu>() as u64,
         );
-        queue.submit(Some(encoder.finish()));
-        let slice = readback.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
-        let mapped = slice.get_mapped_range();
-        let state = *bytemuck::from_bytes::<MotionStateGpu>(&mapped);
-        drop(mapped);
-        readback.unmap();
-        state
+        bytemuck::pod_read_unaligned(&bytes)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2271,32 +2241,15 @@ mod tests {
                 Some(row),
             )
             .unwrap();
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("motion gains parity readback"),
-            size: std::mem::size_of::<MotionStateGpu>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(
+        queue.submit(Some(encoder.finish()));
+        let bytes = read_buffer(
+            device,
+            queue,
             runtime.diagnostic_buffer(),
-            0,
-            &readback,
             0,
             std::mem::size_of::<MotionStateGpu>() as u64,
         );
-        queue.submit(Some(encoder.finish()));
-        let slice = readback.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap()
-        });
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
-        let mapped = slice.get_mapped_range();
-        let state = *bytemuck::from_bytes::<MotionStateGpu>(&mapped);
-        drop(mapped);
-        readback.unmap();
-        state
+        bytemuck::pod_read_unaligned(&bytes)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2311,46 +2264,11 @@ mod tests {
             label: Some("packed motion parity encoder"),
         });
         runtime.dispatch(queue, &mut encoder, sample, true).unwrap();
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("packed motion parity readback"),
-            size: 256,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &runtime.output_texture().texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(256),
-                    rows_per_image: Some(1),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
         queue.submit(Some(encoder.finish()));
-        let slice = readback.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
-        let mapped = slice.get_mapped_range();
-        let output = bytemuck::cast_slice::<u8, u32>(&mapped[..width as usize * 16]).to_vec();
-        drop(mapped);
-        readback.unmap();
-        output
+        read_texture_bytes(device, queue, &runtime.output_texture().texture, [width, 1])
+            .chunks_exact(4)
+            .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect()
     }
 
     fn assert_state_close(label: &str, actual: MotionStateGpu, expected: MotionState) {

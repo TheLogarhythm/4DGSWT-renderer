@@ -6,7 +6,9 @@ use wgpu::util::DeviceExt;
 use crate::camera::{Camera, CameraUniforms};
 use crate::log;
 use crate::motion::{MergedMotion, TimelineSample};
-use crate::motion_brush::{DirtyRect, MotionBrushPreview, MotionFieldCache, MotionOverlayChannel};
+use crate::motion_brush::{
+    DirtyRect, MotionBrushPreview, MotionBrushRuntime, MotionFieldCache, MotionOverlayChannel,
+};
 use crate::motion_brush_gpu::{GpuMotionField, MotionFieldUniform};
 use crate::motion_controller_gpu::{AuthoredMotionDispatch, GpuMotionControllerRuntime};
 use crate::motion_controller_palette::{CompiledMotionField, MotionControllerFrame};
@@ -564,7 +566,59 @@ impl GSWTRenderer {
         self.motion_graph_error.as_deref()
     }
 
-    pub fn sync_motion_field(
+    /// Publish a prepared field (or lightweight preview). Both initial config
+    /// and ordinary frames use this transaction; failed uploads remain dirty.
+    pub fn sync_authoring_field(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        spatial: Option<&mut MotionBrushRuntime>,
+        compiled: Option<&CompiledMotionField>,
+    ) -> Result<u64, String> {
+        let Some(spatial) = spatial.filter(|spatial| spatial.render_path_active()) else {
+            self.disable_motion_field_rendering();
+            return Ok(0);
+        };
+        let Some(compiled) = compiled else {
+            self.disable_motion_field_rendering();
+            return Err("motion field must be compiled before upload".into());
+        };
+        let active = spatial.field_data_active();
+        let mut dirty = if active {
+            spatial.take_dirty_regions()
+        } else {
+            Vec::new()
+        };
+        dirty.extend_from_slice(compiled.dirty_regions());
+        dirty.sort_unstable_by_key(|rect| (rect.min(), rect.max_exclusive()));
+        dirty.dedup();
+        let result = if active {
+            self.sync_motion_field(device, queue, spatial.cache(), compiled, &dirty)
+        } else {
+            self.sync_motion_preview(device, spatial.cache());
+            Ok(0)
+        };
+        match result {
+            Ok(bytes) => {
+                self.update_motion_field_uniform(
+                    queue,
+                    spatial.cache(),
+                    active,
+                    spatial.overlay,
+                    compiled.palette_count(),
+                    spatial.preview(),
+                );
+                Ok(bytes)
+            }
+            Err(error) => {
+                spatial.restore_dirty_regions(dirty);
+                self.disable_motion_field_rendering();
+                Err(error)
+            }
+        }
+    }
+
+    fn sync_motion_field(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,

@@ -395,6 +395,25 @@ native WebGPU adapter is unavailable. The pinned browser build remains:
 wasm-pack build --target web
 ```
 
+## Renderer maintenance boundaries
+
+`worker.rs` owns command batching and worker lifetime. Camera requests coalesce;
+configuration is an ordering barrier. Idle workers wait for an explicit wake,
+and shutdown never joins on the browser main thread. On WASM only the worker
+performs an atomic wait; UI sends notify it without blocking.
+
+Reconfiguration sends a monotonically numbered membership-clear request so stale
+sorts cannot reactivate previous paint. Brush samples stay anchored to the
+original world-space segment regardless of cache clipping.
+
+`GSWTRenderer::sync_authoring_field` is shared by configuration and frame updates;
+failed uploads restore dirty regions for retry. Both motion pipelines compose
+`motion_math.wgsl` through `motion_shader.rs` at pipeline creation.
+
+Native motion GPU tests reuse `src/test_support` without changing skip policies.
+Run GPU tests serially with `--test-threads=1`. Browser paint/pan/reconfigure,
+session save/load and reload/exit still need recorded manual acceptance.
+
 ## Water
 
 In the rendering menu, expand **Water** and enable **Enable water**. Controls update live:

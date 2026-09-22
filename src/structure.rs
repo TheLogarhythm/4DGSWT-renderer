@@ -1,10 +1,4 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc,
-        mpsc::{Receiver, Sender},
-    },
-};
+use std::sync::{Arc, mpsc::Receiver};
 use winit::keyboard::KeyCode;
 
 use crate::control::{CameraControl, FlyPathControl};
@@ -360,12 +354,29 @@ impl MotionRenderData {
             MotionFieldQuality::Default,
         )
         .map_err(|error| error.to_string())?;
-        self.spatial = Some(MotionBrushRuntime::new(layout).map_err(|error| error.to_string())?);
+        let spatial = MotionBrushRuntime::new(layout).map_err(|error| error.to_string())?;
+        // Reconfiguration replaces the field, not the worker. Supersede every
+        // previously sent or pending request with an explicit clear.
+        let previous_revision = self
+            .pending_membership_request
+            .as_ref()
+            .map(|request| request.request_revision)
+            .unwrap_or(self.current_membership_request_revision);
+        let clear = if previous_revision > 0 {
+            Some(AuthoredTagRequest {
+                request_revision: previous_revision
+                    .checked_add(1)
+                    .ok_or("motion membership revision exhausted")?,
+                snapshot: None,
+            })
+        } else {
+            None
+        };
+        self.spatial = Some(spatial);
         self.compiled_spatial = None;
         self.spatial_error = None;
         self.observed_membership_revision = None;
-        self.current_membership_request_revision = 0;
-        self.pending_membership_request = None;
+        self.pending_membership_request = clear;
         Ok(())
     }
 
@@ -784,10 +795,7 @@ pub enum DrawMode {
 }
 
 pub struct MainChannels {
-    pub tx_vp: Sender<Mat4>,
-    pub tx_build_info: Sender<(bool, Vec3)>,
-    pub tx_user_data: Sender<UserData>,
-    pub tx_authored_tag_request: Sender<AuthoredTagRequest>,
+    pub tx_commands: crate::worker::WorkerSender,
 
     pub rx_user_data: Receiver<UserData>,
     pub rx_sort_data: Receiver<SortData>,
@@ -799,19 +807,6 @@ pub struct MainChannels {
     pub rx_height_tex: Option<Receiver<(Vec<f32>, Vector2<usize>)>>,
     pub rx_skybox_tex: Option<Receiver<(SkyboxTexture, Vector2<usize>)>>,
     pub rx_proxy_tex: Option<Receiver<(Vec<Vec<f32>>, Vector2<usize>)>>,
-}
-
-pub struct WorkerChannels {
-    pub rx_vp: Receiver<Mat4>,
-    pub rx_build_info: Receiver<(bool, Vec3)>,
-    pub rx_user_data: Receiver<UserData>,
-    pub rx_authored_tag_request: Receiver<AuthoredTagRequest>,
-
-    pub tx_user_data: Sender<UserData>,
-    pub tx_sort_data: Sender<SortData>,
-    pub tx_scene_data: Sender<SceneData>,
-    pub tx_sort_time: Sender<f64>,
-    pub tx_build_time: Sender<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]

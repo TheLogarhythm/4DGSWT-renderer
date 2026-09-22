@@ -1480,28 +1480,43 @@ fn for_each_stroke_stamp(
     }
 
     for segment in stroke.path.windows(2) {
-        let Some((start, end)) = clip_segment_to_aabb(segment[0], segment[1], world_min, world_max)
+        let Some((enter, exit)) =
+            clip_segment_to_aabb(segment[0], segment[1], world_min, world_max)
         else {
             continue;
         };
-        let delta = [end[0] - start[0], end[1] - start[1]];
+        // The stamp grid belongs to the original segment, not to a cache/dirty
+        // rectangle. Double precision keeps long off-screen segments stable.
+        let start = segment[0].map(f64::from);
+        let delta = [
+            f64::from(segment[1][0]) - start[0],
+            f64::from(segment[1][1]) - start[1],
+        ];
         let distance = delta[0].hypot(delta[1]);
         if distance == 0.0 {
-            emit(start)?;
+            emit(segment[0])?;
             continue;
         }
-        let steps_f = (distance / spacing).ceil().max(1.0);
-        if !steps_f.is_finite() || steps_f > MAX_BRUSH_STAMPS_PER_STROKE as f32 {
+        let steps_f = (distance / f64::from(spacing)).ceil().max(1.0);
+        if !steps_f.is_finite() || steps_f > (1u64 << 53) as f64 {
             return Err(MotionBrushError::new(
                 "motion brush segment exceeds the rasterization safety limit",
             ));
         }
-        let steps = steps_f as usize;
-        for step in 0..=steps {
-            let fraction = step as f32 / steps as f32;
+        // Include one neighboring stamp to absorb clipping roundoff. apply_stamp
+        // clips its actual footprint, so this never paints outside the region.
+        let first = (enter * steps_f).floor().max(0.0) as u64;
+        let last = (exit * steps_f).ceil().min(steps_f) as u64;
+        if last - first >= MAX_BRUSH_STAMPS_PER_STROKE as u64 {
+            return Err(MotionBrushError::new(
+                "motion brush segment exceeds the rasterization safety limit",
+            ));
+        }
+        for step in first..=last {
+            let fraction = step as f64 / steps_f;
             emit([
-                start[0] + delta[0] * fraction,
-                start[1] + delta[1] * fraction,
+                (start[0] + delta[0] * fraction) as f32,
+                (start[1] + delta[1] * fraction) as f32,
             ])?;
         }
     }
@@ -1513,12 +1528,16 @@ fn clip_segment_to_aabb(
     end: [f32; 2],
     min: [f32; 2],
     max: [f32; 2],
-) -> Option<([f32; 2], [f32; 2])> {
+) -> Option<(f64, f64)> {
+    let start = start.map(f64::from);
+    let end = end.map(f64::from);
+    let min = min.map(f64::from);
+    let max = max.map(f64::from);
     let delta = [end[0] - start[0], end[1] - start[1]];
-    let mut enter = 0.0f32;
-    let mut exit = 1.0f32;
+    let mut enter = 0.0f64;
+    let mut exit = 1.0f64;
     for axis in 0..2 {
-        if delta[axis].abs() <= f32::EPSILON {
+        if delta[axis] == 0.0 {
             if start[axis] < min[axis] || start[axis] > max[axis] {
                 return None;
             }
@@ -1532,10 +1551,7 @@ fn clip_segment_to_aabb(
             return None;
         }
     }
-    Some((
-        [start[0] + delta[0] * enter, start[1] + delta[1] * enter],
-        [start[0] + delta[0] * exit, start[1] + delta[1] * exit],
-    ))
+    Some((enter, exit))
 }
 
 fn brush_weight(falloff: MotionBrushFalloff, normalized_distance: f32) -> f32 {
@@ -2212,6 +2228,65 @@ mod tests {
         assert_eq!(cache.storage_offset(), [8, 0]);
         assert_eq!(cache.physical_regions(dirty[0])[0].min(), [0, 0]);
         assert_eq!(cache.physical_regions(dirty[0])[0].max_exclusive(), [8, 8]);
+    }
+
+    #[test]
+    fn ring_shift_replays_segment_stamps_in_world_space() {
+        let first_layout = small_layout([0, 0]);
+        let moved_layout = small_layout([1, 0]);
+        let mut document = MotionBrushDocument::default();
+        document
+            .push_stroke(
+                MotionBrushTool::ApplyBehavior {
+                    region_id: region_id(2),
+                },
+                vec![[-3.8, 2.0], [3.8, 2.0]],
+                1.0,
+                0.3,
+                0.25,
+                MotionBrushFalloff::Smooth,
+            )
+            .unwrap();
+        let original = MotionFieldCache::rebuild(first_layout, &document).unwrap();
+        let mut shifted = MotionFieldCache::rebuild(first_layout, &document).unwrap();
+        shifted.shift_window(moved_layout, &document).unwrap();
+        let rebuilt = MotionFieldCache::rebuild(moved_layout, &document).unwrap();
+        assert_logical_cache_eq(&shifted, &rebuilt);
+        // World [2.25, 2.25] is texel [12,4] before and [4,4] after the shift.
+        assert_eq!(
+            original.continuous_bytes()[original.texel_index(12, 4).unwrap() * 4],
+            rebuilt.continuous_bytes()[rebuilt.texel_index(4, 4).unwrap() * 4]
+        );
+    }
+
+    #[test]
+    fn diagonal_ring_shifts_match_full_stroke_replay() {
+        let layout =
+            |center| MotionFieldLayout::new([3, 3], 4.0, center, MotionFieldQuality::Low).unwrap();
+        let mut document = MotionBrushDocument::default();
+        for path in [
+            vec![[-9.7, -7.3], [10.1, 8.9]],
+            vec![[8.7, -8.3], [-7.9, 9.1]],
+        ] {
+            document
+                .push_stroke(
+                    MotionBrushTool::ApplyBehavior {
+                        region_id: region_id(2),
+                    },
+                    path,
+                    1.1,
+                    0.3,
+                    0.23,
+                    MotionBrushFalloff::Smooth,
+                )
+                .unwrap();
+        }
+        let mut shifted = MotionFieldCache::rebuild(layout([0, 0]), &document).unwrap();
+        for center in [[1, 1], [0, 2], [-1, 1], [0, 0], [-1, -1]] {
+            shifted.shift_window(layout(center), &document).unwrap();
+            let rebuilt = MotionFieldCache::rebuild(layout(center), &document).unwrap();
+            assert_logical_cache_eq(&shifted, &rebuilt);
+        }
     }
 
     #[test]

@@ -470,6 +470,9 @@ impl std::error::Error for MotionFieldGpuError {}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::test_support::gpu::{GpuTestContext, MissingGpu, read_texture_bytes};
+
     use super::*;
     use crate::motion_brush::{
         DirtyRect, MotionBrushDocument, MotionBrushFalloff, MotionBrushPreview, MotionBrushTool,
@@ -536,29 +539,19 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn preview_placeholder_uses_one_texel_without_field_data() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("motion preview GPU test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
-        let (device, _queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("motion preview test device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            }))
-            .unwrap();
+        let Some(GpuTestContext {
+            device,
+            queue: _queue,
+            ..
+        }) = GpuTestContext::new(
+            "motion preview test device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        )
+        else {
+            return;
+        };
 
         let field = GpuMotionField::new_preview(&device, default_layout());
 
@@ -570,28 +563,15 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_field_uses_exact_dimensions_formats_and_dirty_upload_size() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("motion field GPU test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("motion field test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
+        let Some(GpuTestContext { device, queue, .. }) = GpuTestContext::new(
+            "motion field test device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        ) else {
+            return;
+        };
+
         let cache = MotionFieldCache::new(default_layout()).unwrap();
         let field = GpuMotionField::new(&device, &queue, &cache).unwrap();
 
@@ -610,28 +590,15 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_ring_cache_matches_cpu_physical_storage_after_recenter() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("motion field ring GPU test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("motion field ring test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
+        let Some(GpuTestContext { device, queue, .. }) = GpuTestContext::new(
+            "motion field ring test device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        ) else {
+            return;
+        };
+
         let first = MotionFieldLayout::new([2, 1], 4.0, [0, 0], MotionFieldQuality::Low).unwrap();
         let moved = MotionFieldLayout::new([2, 1], 4.0, [1, 0], MotionFieldQuality::Low).unwrap();
         let mut document = MotionBrushDocument::default();
@@ -668,11 +635,11 @@ mod tests {
 
         assert_eq!(field.uniform.storage_offset, [8, 0]);
         assert_eq!(
-            read_texture_bytes(&device, &queue, &field.continuous_texture, [16, 8], 4),
+            read_texture_bytes(&device, &queue, &field.continuous_texture, [16, 8]),
             cache.continuous_bytes()
         );
         assert_eq!(
-            read_texture_bytes(&device, &queue, &field.assignment_texture, [16, 8], 1),
+            read_texture_bytes(&device, &queue, &field.assignment_texture, [16, 8]),
             cache.assignments()
         );
     }
@@ -680,30 +647,15 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_field_uploads_compiled_slots_without_mutating_stable_region_ids() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!(
-                        "compiled motion field GPU test skipped: no native adapter ({error})"
-                    );
-                    return;
-                }
-            };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("compiled motion field test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
+        let Some(GpuTestContext { device, queue, .. }) = GpuTestContext::new(
+            "compiled motion field test device",
+            MissingGpu::Skip,
+            wgpu::PowerPreference::LowPower,
+            |_| wgpu::Features::empty(),
+        ) else {
+            return;
+        };
+
         let layout = MotionFieldLayout::new([1, 1], 4.0, [0, 0], MotionFieldQuality::Low).unwrap();
         let calm = MotionRegionId::local(4).unwrap();
         let mut document = MotionBrushDocument::default();
@@ -742,67 +694,8 @@ mod tests {
             &queue,
             &field.assignment_texture,
             layout.texture_size(),
-            1,
         );
         assert!(uploaded.contains(&1));
         assert!(!uploaded.contains(&4));
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn read_texture_bytes(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        texture: &wgpu::Texture,
-        dimensions: [u32; 2],
-        bytes_per_texel: u32,
-    ) -> Vec<u8> {
-        let row_bytes = dimensions[0] * bytes_per_texel;
-        let padded_row_bytes = row_bytes.div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("motion field ring readback"),
-            size: u64::from(padded_row_bytes) * u64::from(dimensions[1]),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("motion field ring readback encoder"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes),
-                    rows_per_image: Some(dimensions[1]),
-                },
-            },
-            wgpu::Extent3d {
-                width: dimensions[0],
-                height: dimensions[1],
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(encoder.finish()));
-        let slice = readback.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
-        let mapped = slice.get_mapped_range();
-        let mut bytes = Vec::with_capacity((row_bytes * dimensions[1]) as usize);
-        for row in mapped.chunks_exact(padded_row_bytes as usize) {
-            bytes.extend_from_slice(&row[..row_bytes as usize]);
-        }
-        drop(mapped);
-        readback.unmap();
-        bytes
     }
 }

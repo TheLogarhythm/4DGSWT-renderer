@@ -1,11 +1,9 @@
-use std::{f32, sync::Arc, sync::mpsc};
+#[cfg(target_arch = "wasm32")]
+use std::sync::mpsc;
+use std::{f32, sync::Arc};
 
 use winit::{
-    dpi::{PhysicalPosition, PhysicalSize},
-    event::*,
-    event_loop::ActiveEventLoop,
-    keyboard::KeyCode,
-    window::Window,
+    dpi::PhysicalPosition, event::*, event_loop::ActiveEventLoop, keyboard::KeyCode, window::Window,
 };
 
 use crate::camera::Camera;
@@ -13,12 +11,14 @@ use crate::control::FlyPathControl;
 use crate::control::{CameraControl, KeyboardFlyControl};
 use crate::gui::GUI;
 use crate::log;
+#[cfg(test)]
 use crate::motion::{MotionError, MotionPlayback, TimelineSample};
 use crate::motion_brush::{
     canonical_brush_xy, motion_brush_accepts_pointer, motion_brush_drag_should_end,
     motion_brush_preview_hover,
 };
-use crate::motion_tagging::{AuthoredOccurrenceRegistry, AuthoredTagRequest};
+#[cfg(test)]
+use crate::motion_tagging::AuthoredOccurrenceRegistry;
 use crate::profiler::{FrameProfiler, renderer_required_features};
 use crate::proxy::Proxy;
 use crate::renderer::GSWTRenderer;
@@ -29,6 +29,9 @@ use crate::texture::Texture;
 use crate::utils::*;
 use crate::wangtile::WangTile;
 use crate::water::WaterRenderer;
+#[cfg(test)]
+use crate::worker::should_worker_sort;
+use crate::worker::{WorkerCommand, WorkerHandle, launch_worker_thread};
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -48,7 +51,7 @@ pub struct State {
     keyboard_fly_control: KeyboardFlyControl,
     fly_path_control: FlyPathControl,
     channels: Option<MainChannels>,
-    worker_thread_handle: Option<wasm_thread::JoinHandle<()>>,
+    worker_thread_handle: Option<WorkerHandle>,
     #[cfg(target_arch = "wasm32")]
     archive_selection_tx: mpsc::Sender<Result<Option<LoadedArchive>, ArchiveLoadError>>,
     #[cfg(target_arch = "wasm32")]
@@ -238,12 +241,19 @@ impl State {
             render_data.show_motion_authoring_menu = true;
         }
         let (channels, worker_thread_handle) = launch_worker_thread(wang);
+        self.stop_worker();
         self.gswt_renderer = Some(renderer);
         self.channels = Some(channels);
         self.worker_thread_handle = Some(worker_thread_handle);
         self.render_data = render_data;
         self.gui.show_archive_loaded();
         Ok(())
+    }
+
+    pub(crate) fn stop_worker(&mut self) {
+        // WorkerHandle signals Shutdown on drop. Never join on the UI thread.
+        self.worker_thread_handle = None;
+        self.channels = None;
     }
 
     fn service_archive_picker(&mut self) {
@@ -290,9 +300,7 @@ impl State {
     pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
         if key == KeyCode::Escape && pressed {
             event_loop.exit();
-            if let Some(handle) = self.worker_thread_handle.take() {
-                let _ = handle.join();
-            }
+            self.stop_worker();
         }
         self.input_status.update(key, pressed);
 
@@ -559,64 +567,17 @@ impl State {
                             {
                                 motion.spatial_error = Some(error);
                             } else {
-                                let field_data_active = motion
-                                    .spatial
-                                    .as_ref()
-                                    .is_some_and(|spatial| spatial.field_data_active());
-                                let render_path_active = motion
-                                    .spatial
-                                    .as_ref()
-                                    .is_some_and(|spatial| spatial.render_path_active());
-                                let compilation_ok = !render_path_active
-                                    || match motion.compile_spatial_field() {
-                                        Ok(()) => true,
-                                        Err(error) => {
-                                            motion.spatial_error = Some(error.to_string());
-                                            false
-                                        }
-                                    };
-                                if compilation_ok
-                                    && let (Some(spatial), Some(compiled)) =
-                                        (&mut motion.spatial, &motion.compiled_spatial)
-                                {
-                                    if spatial.render_path_active() {
-                                        let mut dirty = field_data_active
-                                            .then(|| spatial.take_dirty_regions())
-                                            .unwrap_or_default();
-                                        dirty.extend_from_slice(compiled.dirty_regions());
-                                        dirty.dedup();
-                                        let sync_result = if field_data_active {
-                                            renderer.sync_motion_field(
-                                                &self.device,
-                                                &self.queue,
-                                                spatial.cache(),
-                                                compiled,
-                                                &dirty,
-                                            )
-                                        } else {
-                                            renderer
-                                                .sync_motion_preview(&self.device, spatial.cache());
-                                            Ok(0)
-                                        };
-                                        if let Err(error) = sync_result {
-                                            spatial.restore_dirty_regions(dirty);
-                                            renderer.disable_motion_field_rendering();
-                                            motion.spatial_error = Some(error);
-                                        } else {
-                                            renderer.update_motion_field_uniform(
-                                                &self.queue,
-                                                spatial.cache(),
-                                                field_data_active,
-                                                spatial.overlay,
-                                                compiled.palette_count(),
-                                                spatial.preview(),
-                                            );
-                                        }
-                                    } else {
-                                        renderer.disable_motion_field_rendering();
-                                    }
-                                } else if !compilation_ok {
+                                let result = prepare_motion_field(motion).and_then(|()| {
+                                    renderer.sync_authoring_field(
+                                        &self.device,
+                                        &self.queue,
+                                        motion.spatial.as_mut(),
+                                        motion.compiled_spatial.as_ref(),
+                                    )
+                                });
+                                if let Err(error) = result {
                                     renderer.disable_motion_field_rendering();
+                                    motion.spatial_error = Some(error);
                                 }
                             }
                         }
@@ -655,6 +616,7 @@ impl State {
                 };
                 let now = get_time_milliseconds();
                 let rd = &mut self.render_data;
+                let mut spatial_frame_ready = true;
                 let frame_delta_milliseconds = (now - rd.frame_prev).max(0.0);
                 rd.frame_time_ma.add(frame_delta_milliseconds);
                 rd.frame_prev = now;
@@ -716,6 +678,7 @@ impl State {
                         }
                     }
                     if let Err(error) = motion.advance_local_controllers(frame_delta_seconds) {
+                        spatial_frame_ready = false;
                         motion.spatial_error = Some(error.to_string());
                     }
                     self.profiler
@@ -752,12 +715,14 @@ impl State {
                 if rd.update_worker {
                     // Send cam pos to worker thread
                     let _ = channels
-                        .tx_build_info
-                        .send((!rd.lock_tile, *self.camera.position()));
+                        .tx_commands
+                        .send(WorkerCommand::Build(!rd.lock_tile, *self.camera.position()));
 
                     // Send view_proj to worker thread
                     if !rd.lock_sort {
-                        let _ = channels.tx_vp.send(self.camera.view_proj());
+                        let _ = channels
+                            .tx_commands
+                            .send(WorkerCommand::View(self.camera.view_proj()));
                     }
                 }
 
@@ -804,31 +769,32 @@ impl State {
                     && spatial.layout().center_tile() != center_tile
                     && let Err(error) = spatial.recenter(center_tile)
                 {
+                    spatial_frame_ready = false;
                     motion.spatial_error = Some(error.to_string());
                 }
 
                 if let Some(motion) = rd.motion.as_mut() {
-                    let render_path_active = motion
-                        .spatial
-                        .as_ref()
-                        .is_some_and(|spatial| spatial.render_path_active());
-                    let compilation_ok = !render_path_active
-                        || match motion.compile_spatial_field() {
-                            Ok(()) => true,
-                            Err(error) => {
-                                motion.spatial_error = Some(error.to_string());
-                                false
-                            }
-                        };
+                    let compilation_ok = match prepare_motion_field(motion) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            spatial_frame_ready = false;
+                            motion.spatial_error = Some(error);
+                            false
+                        }
+                    };
                     if compilation_ok {
                         match motion.take_membership_request() {
                             Ok(Some(request)) => {
                                 let request_revision = request.request_revision;
-                                match channels.tx_authored_tag_request.send(request) {
+                                match channels
+                                    .tx_commands
+                                    .send(WorkerCommand::Membership(request))
+                                {
                                     Ok(()) => {
                                         motion.acknowledge_membership_request(request_revision)
                                     }
                                     Err(error) => {
+                                        spatial_frame_ready = false;
                                         motion.spatial_error = Some(format!(
                                             "Motion membership update will be retried: {error}"
                                         ));
@@ -836,7 +802,10 @@ impl State {
                                 }
                             }
                             Ok(None) => {}
-                            Err(error) => motion.spatial_error = Some(error.to_string()),
+                            Err(error) => {
+                                spatial_frame_ready = false;
+                                motion.spatial_error = Some(error.to_string());
+                            }
                         }
                     }
                 }
@@ -864,69 +833,33 @@ impl State {
 
                 let awaiting_scene_commit = rd.next_scene_data_id.is_some();
                 if !awaiting_scene_commit && let Some(motion) = rd.motion.as_mut() {
-                    let field_data_active = motion
-                        .spatial
-                        .as_ref()
-                        .is_some_and(|spatial| spatial.field_data_active());
-                    let compilation_ok = motion.compiled_spatial.is_some()
-                        || !motion
-                            .spatial
-                            .as_ref()
-                            .is_some_and(|spatial| spatial.render_path_active());
-                    if compilation_ok
-                        && let (Some(spatial), Some(compiled)) =
-                            (&mut motion.spatial, &motion.compiled_spatial)
-                    {
-                        if spatial.render_path_active() {
-                            let mut dirty = field_data_active
-                                .then(|| spatial.take_dirty_regions())
-                                .unwrap_or_default();
-                            dirty.extend_from_slice(compiled.dirty_regions());
-                            dirty.dedup();
-                            let sync_result = if field_data_active {
-                                renderer.sync_motion_field(
-                                    &self.device,
-                                    &self.queue,
-                                    spatial.cache(),
-                                    compiled,
-                                    &dirty,
-                                )
-                            } else {
-                                renderer.sync_motion_preview(&self.device, spatial.cache());
-                                Ok(0)
-                            };
-                            match sync_result {
-                                Ok(uploaded_bytes) => {
-                                    if rd.profiler_enabled {
-                                        let counters = self.profiler.counters_mut();
-                                        counters.uploaded_bytes =
-                                            counters.uploaded_bytes.saturating_add(uploaded_bytes);
-                                    }
-                                    motion.spatial_error = None;
-                                    renderer.update_motion_field_uniform(
-                                        &self.queue,
-                                        spatial.cache(),
-                                        field_data_active,
-                                        spatial.overlay,
-                                        compiled.palette_count(),
-                                        spatial.preview(),
-                                    );
+                    if spatial_frame_ready {
+                        match renderer.sync_authoring_field(
+                            &self.device,
+                            &self.queue,
+                            motion.spatial.as_mut(),
+                            motion.compiled_spatial.as_ref(),
+                        ) {
+                            Ok(bytes) => {
+                                if rd.profiler_enabled {
+                                    let counters = self.profiler.counters_mut();
+                                    counters.uploaded_bytes =
+                                        counters.uploaded_bytes.saturating_add(bytes);
                                 }
-                                Err(error) => {
-                                    spatial.restore_dirty_regions(dirty);
-                                    renderer.disable_motion_field_rendering();
-                                    motion.spatial_error = Some(error);
-                                }
+                                motion.spatial_error = None;
                             }
-                        } else {
-                            renderer.disable_motion_field_rendering();
+                            Err(error) => {
+                                spatial_frame_ready = false;
+                                motion.spatial_error = Some(error);
+                            }
                         }
-                    } else if !compilation_ok {
+                    }
+                    if !spatial_frame_ready {
                         renderer.disable_motion_field_rendering();
+                        renderer.disable_authored_motion("Spatial frame preparation failed".into());
                     }
                 }
-
-                let authored_request = (!awaiting_scene_commit)
+                let authored_request = (!awaiting_scene_commit && spatial_frame_ready)
                     .then(|| rd.motion.as_ref())
                     .flatten()
                     .and_then(|motion| {
@@ -989,7 +922,7 @@ impl State {
                             }
                         }
                     }
-                } else if !awaiting_scene_commit {
+                } else if !awaiting_scene_commit && spatial_frame_ready {
                     renderer.clear_authored_motion();
                 }
 
@@ -1122,6 +1055,20 @@ impl State {
     }
 }
 
+fn prepare_motion_field(motion: &mut MotionRenderData) -> Result<(), String> {
+    if motion
+        .spatial
+        .as_ref()
+        .is_some_and(|spatial| spatial.render_path_active())
+    {
+        motion
+            .compile_spatial_field()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn advance_motion_for_frame(
     playback: &mut MotionPlayback,
     delta_seconds: f32,
@@ -1134,55 +1081,6 @@ fn advance_motion_for_frame(
     let changed = playback.take_dirty();
     playback.take_position_dirty();
     Ok(changed.then_some(sample))
-}
-
-fn view_matrix_difference(previous: Mat4, current: Mat4) -> f32 {
-    let diff = previous - current;
-    diff[0][0].abs()
-        + diff[0][1].abs()
-        + diff[0][2].abs()
-        + diff[0][3].abs()
-        + diff[1][0].abs()
-        + diff[1][1].abs()
-        + diff[1][2].abs()
-        + diff[1][3].abs()
-        + diff[2][0].abs()
-        + diff[2][1].abs()
-        + diff[2][2].abs()
-        + diff[2][3].abs()
-        + diff[3][0].abs()
-        + diff[3][1].abs()
-        + diff[3][2].abs()
-        + diff[3][3].abs()
-}
-
-fn should_worker_sort(
-    force_sort: bool,
-    received_view: bool,
-    always_sort: bool,
-    previous_view: Option<Mat4>,
-    current_view: Option<Mat4>,
-) -> bool {
-    let Some(current_view) = current_view else {
-        return false;
-    };
-    if force_sort {
-        return true;
-    }
-    if !received_view {
-        return false;
-    }
-    always_sort
-        || previous_view
-            .is_none_or(|previous| view_matrix_difference(previous, current_view) >= 0.01)
-}
-
-fn newest_authored_request(
-    requests: impl IntoIterator<Item = AuthoredTagRequest>,
-) -> Option<AuthoredTagRequest> {
-    requests
-        .into_iter()
-        .max_by_key(|request| request.request_revision)
 }
 
 fn accept_authored_sort(current_request_revision: u64, sort_data: &SortData) -> bool {
@@ -1203,156 +1101,6 @@ fn accept_authored_sort(current_request_revision: u64, sort_data: &SortData) -> 
         && update.inputs.len() == update.output_base_rows.len()
 }
 
-pub fn launch_worker_thread(mut wang: WangTile) -> (MainChannels, wasm_thread::JoinHandle<()>) {
-    let (tx_vp, rx_vp) = mpsc::channel::<Mat4>();
-    let (tx_build_info, rx_build_info) = mpsc::channel::<(bool, Vec3)>(); // (do_build, camera_pos)
-    let (tx_main_user_data, rx_worker_user_data) = mpsc::channel::<UserData>();
-    let (tx_authored_tag_request, rx_authored_tag_request) = mpsc::channel::<AuthoredTagRequest>();
-
-    let (tx_worker_user_data, rx_main_user_data) = mpsc::channel::<UserData>(); // Post config user data
-    let (tx_sort_data, rx_sort_data) = mpsc::channel::<SortData>();
-    let (tx_scene_data, rx_scene_data) = mpsc::channel::<SceneData>();
-    let (tx_sort_time, rx_sort_time) = mpsc::channel::<f64>();
-    let (tx_build_time, rx_build_time) = mpsc::channel::<f64>();
-
-    let main_channels = MainChannels {
-        tx_vp,
-        tx_build_info,
-        tx_user_data: tx_main_user_data,
-        tx_authored_tag_request,
-        rx_user_data: rx_main_user_data,
-        rx_sort_data,
-        rx_scene_data,
-        rx_sort_time,
-        rx_build_time,
-        rx_fly_path_control: None,
-        rx_height_tex: None,
-        rx_skybox_tex: None,
-        rx_proxy_tex: None,
-    };
-
-    let worker_channels = WorkerChannels {
-        rx_vp,
-        rx_build_info,
-        rx_user_data: rx_worker_user_data,
-        rx_authored_tag_request,
-        tx_user_data: tx_worker_user_data,
-        tx_sort_data,
-        tx_scene_data,
-        tx_sort_time,
-        tx_build_time,
-    };
-
-    // launch another thread for view-dependent splat sorting
-    let thread_handle = wasm_thread::spawn({
-        let mut cur_camera_pos: Option<Vector3<f32>> = None;
-        let mut prev_vp: Option<Mat4> = None;
-        let mut last_vp: Option<Mat4> = None;
-        let mut next_scene_id: u32 = 0;
-        let mut authored_registry = AuthoredOccurrenceRegistry::default();
-        let mut force_authored_sort = false;
-
-        move || loop {
-            if let Ok(user_data) = worker_channels.rx_user_data.try_recv() {
-                let wang_user_data = wang.configure(user_data);
-                worker_channels
-                    .tx_user_data
-                    .send(wang_user_data)
-                    .expect("Error sending wang user data");
-                cur_camera_pos = None;
-                prev_vp = None;
-                last_vp = None;
-            }
-
-            let mut authored_requests = Vec::new();
-            while let Ok(request) = worker_channels.rx_authored_tag_request.try_recv() {
-                authored_requests.push(request);
-            }
-            if let Some(request) = newest_authored_request(authored_requests)
-                && request.request_revision > authored_registry.request_revision()
-            {
-                let scene_id = next_scene_id.saturating_sub(1);
-                if let Err(error) = authored_registry.reset(scene_id, request) {
-                    log!("Rejected authored membership request: {error}");
-                } else {
-                    force_authored_sort = true;
-                }
-            }
-
-            let mut recv_build = false;
-            let mut do_build = false;
-            let mut camera_pos = Vec3::zero();
-            while let Ok((a, b)) = worker_channels.rx_build_info.try_recv() {
-                recv_build = true;
-                do_build = a;
-                camera_pos = b;
-            }
-            if recv_build {
-                cur_camera_pos = Some(camera_pos);
-
-                if do_build && wang.check_update(&camera_pos) {
-                    let start = get_time_milliseconds();
-                    let mut scene_data = wang.build_tiles(camera_pos);
-                    scene_data.scene_id = next_scene_id;
-                    if let Err(error) =
-                        authored_registry.reset(next_scene_id, authored_registry.current_request())
-                    {
-                        log!("Failed to retarget authored occurrence registry: {error}");
-                    }
-                    let build_time = get_time_milliseconds() - start;
-
-                    let _ = worker_channels.tx_scene_data.send(scene_data);
-                    let _ = worker_channels.tx_build_time.send(build_time);
-                    next_scene_id += 1;
-                }
-            }
-
-            let mut recv_vp = false;
-            let mut view_proj = Mat4::identity();
-            while let Ok(a) = worker_channels.rx_vp.try_recv() {
-                recv_vp = true;
-                view_proj = a;
-            }
-            if recv_vp {
-                last_vp = Some(view_proj);
-            }
-            if cur_camera_pos.is_some()
-                && should_worker_sort(
-                    force_authored_sort,
-                    recv_vp,
-                    wang.user_data.always_sort,
-                    prev_vp,
-                    last_vp,
-                )
-            {
-                let view_proj = last_vp.expect("worker sort decision requires a current view");
-                let start = get_time_milliseconds();
-                // TODO: fix cur_camera_pos when lock tile
-                match wang.sort_tiles(
-                    cur_camera_pos.expect("worker sort requires a camera position"),
-                    view_proj,
-                    &mut authored_registry,
-                ) {
-                    Ok(mut sort_data) => {
-                        sort_data.scene_id = next_scene_id.saturating_sub(1);
-                        prev_vp = Some(view_proj);
-                        force_authored_sort = false;
-                        let sort_time = get_time_milliseconds() - start;
-                        let _ = worker_channels.tx_sort_data.send(sort_data);
-                        let _ = worker_channels.tx_sort_time.send(sort_time);
-                    }
-                    Err(error) => {
-                        force_authored_sort = false;
-                        log!("Rejected authored worker sort: {error}");
-                    }
-                }
-            }
-        }
-    });
-
-    (main_channels, thread_handle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,7 +1114,6 @@ mod tests {
     use crate::motion_graph::{
         MotionGraph, MotionGraphNode, MotionGraphSettings, SOURCE_SEGMENT_COUNT,
     };
-    use crate::motion_tagging::{AuthoredTagRequest, MotionMembershipSnapshot};
     use crate::scene_archive::{DynamicArchiveSummary, load_archive_bytes};
 
     fn synthetic_summary() -> DynamicArchiveSummary {
@@ -1425,39 +1172,6 @@ mod tests {
             Some(view),
             Some(changed)
         ));
-    }
-
-    #[test]
-    fn authored_request_drain_keeps_only_the_greatest_revision() {
-        let snapshot = Arc::new(MotionMembershipSnapshot::new(
-            3,
-            1,
-            [1, 1],
-            [1, 1],
-            [0.0, 0.0],
-            [1.0, 1.0],
-            [0, 0],
-            Arc::from([1_u8]),
-            Arc::from([1_u8]),
-        ));
-        let requests = vec![
-            AuthoredTagRequest {
-                request_revision: 2,
-                snapshot: None,
-            },
-            AuthoredTagRequest {
-                request_revision: 3,
-                snapshot: Some(snapshot),
-            },
-            AuthoredTagRequest {
-                request_revision: 1,
-                snapshot: None,
-            },
-        ];
-
-        let newest = newest_authored_request(requests).unwrap();
-        assert_eq!(newest.request_revision, 3);
-        assert!(newest.snapshot.is_some());
     }
 
     fn graph_with_jump_from_zero() -> Arc<MotionGraph> {
@@ -1852,6 +1566,61 @@ mod tests {
         let erase = motion.take_membership_request().unwrap().unwrap();
         assert_eq!(erase.request_revision, 2);
         assert!(erase.snapshot.is_none());
+    }
+
+    #[test]
+    fn reconfiguration_clears_worker_membership_without_reusing_revisions() {
+        let mut motion =
+            MotionRenderData::new(synthetic_summary(), 2.0, Some(graph_without_jumps()), None)
+                .unwrap();
+        let mut config = UserData::new();
+        config.tile_map_wh = Vector2::new(1, 1);
+        motion.configure_spatial_authoring(&config, [0, 0]).unwrap();
+        assert!(motion.take_membership_request().unwrap().is_none());
+        let spatial = motion.spatial.as_mut().unwrap();
+        spatial.enabled = true;
+        spatial.begin_stroke([2.0, 2.0]).unwrap();
+        spatial.end_stroke().unwrap();
+        motion.compile_spatial_field().unwrap();
+        let paint = motion.take_membership_request().unwrap().unwrap();
+        assert_eq!(paint.request_revision, 1);
+        motion.acknowledge_membership_request(paint.request_revision);
+
+        motion.configure_spatial_authoring(&config, [0, 0]).unwrap();
+        // The empty field need not be compiled or shown to clear the worker.
+        assert!(motion.compiled_spatial.is_none());
+        let clear = motion.take_membership_request().unwrap().unwrap();
+        assert_eq!(clear.request_revision, 2);
+        assert!(clear.snapshot.is_none());
+        assert_eq!(
+            motion
+                .take_membership_request()
+                .unwrap()
+                .unwrap()
+                .request_revision,
+            2
+        );
+
+        // Reconfiguring again must supersede even an unacknowledged clear.
+        motion.configure_spatial_authoring(&config, [1, 0]).unwrap();
+        let next_clear = motion.take_membership_request().unwrap().unwrap();
+        assert_eq!(next_clear.request_revision, 3);
+        motion.acknowledge_membership_request(2);
+        assert_eq!(motion.current_membership_request_revision(), 1);
+        motion.acknowledge_membership_request(3);
+        let mut worker = AuthoredOccurrenceRegistry::default();
+        worker.reset(7, next_clear).unwrap();
+        let sort = SortData {
+            scene_id: 7,
+            tile_instance_vec: Vec::new(),
+            render_data_vec: Vec::new(),
+            authored: worker.finish_sort(Vec::new(), 0, 0.0).unwrap(),
+        };
+        assert!(accept_authored_sort(
+            motion.current_membership_request_revision(),
+            &sort
+        ));
+        assert!(!accept_authored_sort(1, &sort));
     }
 
     #[test]

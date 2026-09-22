@@ -263,7 +263,9 @@ impl GpuMotionControllerRuntime {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Authored Motion Controller Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("motion_controller_compute.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::motion_shader::source(include_str!("motion_controller_compute.wgsl")).into(),
+            ),
         });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Authored Motion Controller Compute Pipeline"),

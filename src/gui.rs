@@ -193,8 +193,10 @@ impl GUI {
                         log!("Config {} confirmed.", self.config_next_id);
                         self.config_confirmed = false;
                         channels
-                            .tx_user_data
-                            .send(self.config_user_data.clone())
+                            .tx_commands
+                            .send(crate::worker::WorkerCommand::Configure(Box::new(
+                                self.config_user_data.clone(),
+                            )))
                             .expect("Error sending user data to worker thread.");
                         self.gui_status = GUIStatus::PostConfig;
                         self.config_next_id += 1;
