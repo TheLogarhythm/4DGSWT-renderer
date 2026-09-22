@@ -76,6 +76,11 @@ struct CanonicalGpu {
     rotation: [f32; 4],
 }
 
+fn pack_canonical_chunk(rows: &[CanonicalGaussian], output: &mut Vec<CanonicalGpu>) {
+    output.clear();
+    output.extend(rows.iter().copied().map(CanonicalGpu::from));
+}
+
 impl From<CanonicalGaussian> for CanonicalGpu {
     fn from(canonical: CanonicalGaussian) -> Self {
         Self {
@@ -230,12 +235,12 @@ fn separate_coefficient_index(
         .ok_or_else(|| "three-bank coefficient index overflow".to_string())
 }
 
-fn pack_separate_coefficients(
+fn pack_separate_coefficients<'a>(
     basis_ids: &[u8],
-    weights: &[f32],
+    weights: &'a [f32],
     row_count: usize,
     top_k: usize,
-) -> Result<(Vec<u32>, Vec<f32>), String> {
+) -> Result<(Vec<u32>, &'a [f32]), String> {
     if row_count == 0 || top_k == 0 {
         return Err("row count and top_k must be positive".to_string());
     }
@@ -254,7 +259,7 @@ fn pack_separate_coefficients(
             .iter()
             .map(|&basis_id| u32::from(basis_id))
             .collect(),
-        weights.to_vec(),
+        weights,
     ))
 }
 
@@ -570,7 +575,7 @@ impl GpuMotionRuntime {
                     GpuBasisSource::Separate(basis_banks.clone()),
                     *top_k,
                     Cow::Owned(basis_ids),
-                    Cow::Owned(weights),
+                    Cow::Borrowed(weights),
                 )
             }
         };
@@ -832,17 +837,15 @@ impl GpuMotionRuntime {
             cpu_motion_bytes as f64 / (1024.0 * 1024.0),
             gpu_motion_bytes as f64 / (1024.0 * 1024.0),
         );
-        let canonical_gpu = motion
-            .canonical
-            .iter()
-            .copied()
-            .map(CanonicalGpu::from)
-            .collect::<Vec<_>>();
-        let transform_ids = motion.transform_ids.iter().copied().collect::<Vec<_>>();
-        let motion_channel_masks = motion.motion_channel_masks.clone();
+        // Only one upload chunk needs staging. Immutable IDs/masks already have
+        // the required GPU layout and can be borrowed directly.
+        let mut canonical_gpu = Vec::new();
+        let transform_ids = &motion.transform_ids;
+        let motion_channel_masks = &motion.motion_channel_masks;
         let mut chunks = Vec::with_capacity(row_chunks.len());
         for layout in row_chunks {
             let row_end = layout.start + layout.count;
+            pack_canonical_chunk(&motion.canonical[layout.start..row_end], &mut canonical_gpu);
             let (coefficient_start, coefficient_end) = if coefficient_bank_count == 3 {
                 (
                     separate_coefficient_index(layout.start, 0, 0, top_k)?,
@@ -861,7 +864,7 @@ impl GpuMotionRuntime {
             };
             let canonical_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Dynamic Canonical Chunk"),
-                contents: bytemuck::cast_slice(&canonical_gpu[layout.start..row_end]),
+                contents: bytemuck::cast_slice(&canonical_gpu),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let basis_ids_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1301,6 +1304,37 @@ mod tests {
     use crate::test_support::gpu::{GpuTestContext, MissingGpu, read_buffer, read_texture_bytes};
 
     use super::*;
+
+    #[test]
+    fn canonical_chunk_packing_reuses_storage_without_stale_rows() {
+        let a = CanonicalGaussian {
+            position: [1.0, -2.0, 3.0],
+            log_scale: [-0.0, 0.5, -1.0],
+            rotation: [0.5, -0.5, 0.5, -0.5],
+        };
+        let b = CanonicalGaussian {
+            position: [7.0, 8.0, 9.0],
+            ..a
+        };
+        let mut packed = Vec::new();
+        pack_canonical_chunk(&[a, b], &mut packed);
+        let storage = packed.as_ptr();
+        let floats: &[f32] = bytemuck::cast_slice(&packed);
+        let expected: [f32; 24] = [
+            1.0, -2.0, 3.0, 0.0, -0.0, 0.5, -1.0, 0.0, 0.5, -0.5, 0.5, -0.5, 7.0, 8.0, 9.0, 0.0,
+            -0.0, 0.5, -1.0, 0.0, 0.5, -0.5, 0.5, -0.5,
+        ];
+        assert_eq!(
+            floats.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            expected.map(f32::to_bits)
+        );
+        pack_canonical_chunk(&[b], &mut packed);
+        assert_eq!(packed.as_ptr(), storage);
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].position, [7.0, 8.0, 9.0, 0.0]);
+        pack_canonical_chunk(&[], &mut packed);
+        assert!(packed.is_empty());
+    }
     use crate::dynamic_archive::{BasisBank, BasisBanks};
     use crate::motion::{
         ALL_MOTION_MASK, BasisBanksFrame, BasisFrame, CanonicalGaussian, MotionState,
@@ -1512,6 +1546,11 @@ mod tests {
             vec![10_u32, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61]
         );
         assert_eq!(packed_weights, weights);
+        assert_eq!(
+            packed_weights.as_ptr(),
+            weights.as_ptr(),
+            "already packed weights must be borrowed"
+        );
         assert_eq!(separate_coefficient_index(0, 0, 0, 2).unwrap(), 0);
         assert_eq!(separate_coefficient_index(0, 2, 1, 2).unwrap(), 5);
         assert_eq!(separate_coefficient_index(1, 0, 0, 2).unwrap(), 6);

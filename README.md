@@ -513,6 +513,17 @@ The older bundled Binaryen 117 aborts in its Precompute pass on this project.
 
 ## Performance profiling
 
+Startup logs separate archive read, decode/validation, Wang-tile preprocessing,
+motion graph and GPU preparation/submission; the last measures CPU work and API
+submission, not completed GPU execution. Compare the same asset after a full reload.
+
+Preprocessing computes raw depths before the LoD-transition sort, avoiding a
+discarded intermediate sort for each of 25 directions. Symmetric boundary metrics
+need 2,773 measurements for all 5,329 directed candidates; the 2,048-row sample,
+qualification and ranking remain unchanged. Upload borrows weights/IDs/masks,
+reuses chunk-sized canonical staging and allocates only the active coefficient
+format. Whole-load speedups still require browser measurements.
+
 Press **P** during rendering to open the performance panel. The detailed
 profiler reports rolling mean and p95 timings for the CPU frame, motion
 preparation, Gaussian render encoding/uploads, worker sort/build work, GPU

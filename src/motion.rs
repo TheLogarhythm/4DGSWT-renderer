@@ -122,8 +122,12 @@ pub fn merge_dynamic_asset(asset: DynamicAsset) -> Result<MergedMotion, MotionEr
     let bank_coefficient_capacity = coefficient_capacity
         .checked_mul(3)
         .ok_or_else(|| MotionError::new("merged bank coefficient count overflow"))?;
-    let mut legacy_basis_ids = Vec::with_capacity(coefficient_capacity);
-    let mut bank_basis_ids = Vec::with_capacity(bank_coefficient_capacity);
+    let mut legacy_basis_ids = Vec::with_capacity(if separate { 0 } else { coefficient_capacity });
+    let mut bank_basis_ids = Vec::with_capacity(if separate {
+        bank_coefficient_capacity
+    } else {
+        0
+    });
     let mut weights = Vec::with_capacity(if separate {
         bank_coefficient_capacity
     } else {

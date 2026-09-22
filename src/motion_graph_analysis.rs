@@ -143,56 +143,75 @@ fn measure_motion_candidates(
     let scales = equivalent_step_scales(&kinematics, dt)?;
     let segment_features = aggregate_segment_features(&kinematics)?;
 
-    let mut nodes = Vec::with_capacity(SOURCE_SEGMENT_COUNT);
     let mut scratch: [Vec<f32>; 9] = std::array::from_fn(|_| Vec::with_capacity(rows.len()));
-    for source_segment in 0..SOURCE_SEGMENT_COUNT {
-        let mut candidates = Vec::with_capacity(SOURCE_SEGMENT_COUNT.saturating_sub(2));
-        for target_segment in 0..SOURCE_SEGMENT_COUNT {
-            if target_segment == source_segment || target_segment == source_segment + 1 {
-                continue;
+    let nodes = measure_candidate_pairs(|from_sample, to_sample| {
+        for values in &mut scratch {
+            values.clear();
+        }
+        for trajectory in &kinematics {
+            let raw = boundary_metrics(trajectory, from_sample, to_sample);
+            if raw.into_iter().any(|value| !value.is_finite()) {
+                return Err(MotionGraphAnalysisError::new(
+                    "motion graph candidate produced a non-finite discontinuity",
+                ));
             }
-            for values in &mut scratch {
-                values.clear();
-            }
-            for trajectory in &kinematics {
-                let raw = boundary_metrics(trajectory, source_segment + 1, target_segment);
-                if raw.into_iter().any(|value| !value.is_finite()) {
+            for (metric, (value, scale)) in scratch
+                .iter_mut()
+                .zip(raw.into_iter().zip(scales.into_iter()))
+            {
+                let normalized = value / scale;
+                if !normalized.is_finite() {
                     return Err(MotionGraphAnalysisError::new(
-                        "motion graph candidate produced a non-finite discontinuity",
+                        "motion graph candidate normalization overflowed",
                     ));
                 }
-                for (metric, (value, scale)) in scratch
-                    .iter_mut()
-                    .zip(raw.into_iter().zip(scales.into_iter()))
-                {
-                    let normalized = value / scale;
-                    if !normalized.is_finite() {
-                        return Err(MotionGraphAnalysisError::new(
-                            "motion graph candidate normalization overflowed",
-                        ));
-                    }
-                    metric.push(normalized);
-                }
+                metric.push(normalized);
             }
-            let p95 = std::array::from_fn(|index| percentile_95(&mut scratch[index]));
-            let ceiling =
-                std::array::from_fn(|index| scratch[index].iter().copied().fold(0.0_f32, f32::max));
-            candidates.push(MotionJump::unranked(
-                target_segment,
-                MotionDiscontinuity {
-                    p95: metric_set(p95),
-                    ceiling: metric_set(ceiling),
-                },
-            ));
         }
-        nodes.push(candidates);
-    }
+        let p95 = std::array::from_fn(|index| percentile_95(&mut scratch[index]));
+        let ceiling =
+            std::array::from_fn(|index| scratch[index].iter().copied().fold(0.0_f32, f32::max));
 
+        Ok(MotionDiscontinuity {
+            p95: metric_set(p95),
+            ceiling: metric_set(ceiling),
+        })
+    })?;
     Ok(MeasuredMotionGraph {
         candidates: nodes,
         segment_features,
         analyzed_rows: rows.len(),
     })
+}
+
+/// Distances are symmetric in boundary samples, but graph edges are directed.
+/// Preserve candidate order/exclusions and cache only the measured distances.
+fn measure_candidate_pairs(
+    mut measure: impl FnMut(usize, usize) -> Result<MotionDiscontinuity, MotionGraphAnalysisError>,
+) -> Result<Vec<Vec<MotionJump>>, MotionGraphAnalysisError> {
+    let mut cache = vec![None; MOTION_SAMPLE_COUNT * MOTION_SAMPLE_COUNT];
+    let mut nodes = Vec::with_capacity(SOURCE_SEGMENT_COUNT);
+    for source in 0..SOURCE_SEGMENT_COUNT {
+        let mut candidates = Vec::with_capacity(SOURCE_SEGMENT_COUNT - 2);
+        for target in 0..SOURCE_SEGMENT_COUNT {
+            if target == source || target == source + 1 {
+                continue;
+            }
+            let from = source + 1;
+            let key = from.min(target) * MOTION_SAMPLE_COUNT + from.max(target);
+            let discontinuity = match cache[key] {
+                Some(value) => value,
+                None => {
+                    let value = measure(from, target)?;
+                    cache[key] = Some(value);
+                    value
+                }
+            };
+            candidates.push(MotionJump::unranked(target, discontinuity));
+        }
+        nodes.push(candidates);
+    }
+    Ok(nodes)
 }
 
 fn aggregate_segment_features(
@@ -825,6 +844,99 @@ mod tests {
             member_offsets: vec![offsets],
             member_counts: vec![counts.to_vec()],
         }
+    }
+
+    #[test]
+    fn symmetric_pair_cache_preserves_all_directed_measurements() {
+        // Changing boundary indices to segment indices, skipping candidates, or
+        // caching direction-dependent decisions must break this comparison.
+        let mut motion = static_motion_with_members(&[11, 12]);
+        if let MergedMotionData::Legacy { basis, weights, .. } = &mut motion.data {
+            basis.values = (0..MOTION_SAMPLE_COUNT)
+                .flat_map(|t| {
+                    let x = t as f32 * 0.07;
+                    [
+                        x.sin(),
+                        x * x,
+                        -x,
+                        0.0,
+                        x * 0.2,
+                        0.0,
+                        x * 0.1,
+                        -x.cos(),
+                        x * x * 0.01,
+                    ]
+                })
+                .collect();
+            for (row, weight) in weights.iter_mut().enumerate() {
+                *weight = 0.1 + row as f32 * 0.09;
+            }
+        }
+        for (row, mask) in motion.motion_channel_masks.iter_mut().enumerate() {
+            *mask = [1, 3, 7][row % 3];
+        }
+        let rows = select_lod0_rows(&motion, DEFAULT_GRAPH_ANALYSIS_ROW_BUDGET).unwrap();
+        let dt = motion.source_duration_seconds / SOURCE_SEGMENT_COUNT as f32;
+        let trajectories = evaluate_trajectories(&motion, &rows)
+            .unwrap()
+            .iter()
+            .map(|states| derive_kinematics(states, dt).unwrap())
+            .collect::<Vec<_>>();
+        let scales = equivalent_step_scales(&trajectories, dt).unwrap();
+        let reference = |from, to| {
+            let mut values: [Vec<f32>; 9] = std::array::from_fn(|_| Vec::new());
+            for trajectory in &trajectories {
+                for (i, raw) in boundary_metrics(trajectory, from, to)
+                    .into_iter()
+                    .enumerate()
+                {
+                    values[i].push(raw / scales[i]);
+                }
+            }
+            for v in &mut values {
+                v.sort_by(f32::total_cmp);
+            }
+            MotionDiscontinuity {
+                p95: metric_set(std::array::from_fn(|i| values[i][21])),
+                ceiling: metric_set(std::array::from_fn(|i| values[i][22])),
+            }
+        };
+        let mut evaluations = 0;
+        let candidates = measure_candidate_pairs(|from, to| {
+            evaluations += 1;
+            Ok(reference(from, to))
+        })
+        .unwrap();
+        assert_eq!(evaluations, 2773);
+        assert_eq!(
+            measure_motion_candidates(&motion).unwrap().candidates,
+            candidates
+        );
+        assert_eq!(candidates.iter().map(Vec::len).sum::<usize>(), 5329);
+        for (source, jumps) in candidates.iter().enumerate() {
+            let expected = (0..SOURCE_SEGMENT_COUNT)
+                .filter(|&target| target != source && target != source + 1)
+                .map(|target| MotionJump::unranked(target, reference(source + 1, target)))
+                .collect::<Vec<_>>();
+            assert_eq!(*jumps, expected);
+            assert_eq!(
+                rank_eligible_jumps(source, jumps.clone(), MotionGraphSettings::default()),
+                rank_eligible_jumps(source, expected, MotionGraphSettings::default()),
+            );
+        }
+    }
+
+    #[test]
+    fn symmetric_pair_cache_propagates_measurement_errors() {
+        let result = measure_candidate_pairs(|_, _| {
+            Err(MotionGraphAnalysisError::new("invalid measurement"))
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid measurement")
+        );
     }
 
     #[test]

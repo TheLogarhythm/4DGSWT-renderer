@@ -501,7 +501,19 @@ pub async fn pick_archive() -> Result<Option<LoadedArchive>, ArchiveLoadError> {
     else {
         return Ok(None);
     };
-    load_archive_bytes(file.read().await).map(Some)
+    let read_start = crate::utils::get_time_milliseconds();
+    let bytes = file.read().await;
+    crate::log!(
+        "Startup archive read: {:.1} ms",
+        crate::utils::get_time_milliseconds() - read_start
+    );
+    let decode_start = crate::utils::get_time_milliseconds();
+    let result = load_archive_bytes(bytes);
+    crate::log!(
+        "Startup archive decode/validation: {:.1} ms",
+        crate::utils::get_time_milliseconds() - decode_start
+    );
+    result.map(Some)
 }
 
 #[cfg(test)]

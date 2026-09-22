@@ -351,11 +351,18 @@ impl GSWTRenderer {
         let texture_width = preload_data.tile_splats_merged.tex_width as u32;
         let texture_height = preload_data.tile_splats_merged.tex_height as u32;
         let base_texels = preload_data.tile_splats_merged.tex_data.as_slice();
+        let graph_start = get_time_milliseconds();
         let graph_outcome = preload_data
             .merged_motion
             .as_ref()
             .map(build_motion_graph_outcome)
             .unwrap_or_default();
+        if preload_data.merged_motion.is_some() {
+            log!(
+                "Startup motion graph: {:.1} ms",
+                get_time_milliseconds() - graph_start
+            );
+        }
         if let Some(graph) = graph_outcome.graph.as_ref() {
             let summary = graph.summary();
             log!(
@@ -370,14 +377,20 @@ impl GSWTRenderer {
         let motion_runtime = preload_data
             .merged_motion
             .map(|motion| {
-                GpuMotionRuntime::new(
+                let preparation_start = get_time_milliseconds();
+                let result = GpuMotionRuntime::new(
                     device,
                     queue,
                     motion,
                     base_texels,
                     texture_width,
                     texture_height,
-                )
+                );
+                log!(
+                    "Startup motion GPU preparation/submission: {:.1} ms",
+                    get_time_milliseconds() - preparation_start
+                );
+                result
             })
             .transpose()?;
         let gaussian_texture = if let Some(runtime) = motion_runtime.as_ref() {

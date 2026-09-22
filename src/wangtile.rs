@@ -355,7 +355,7 @@ impl WangTile {
                     ];
 
                     let scene = &self.tile_splats_vec[i][j];
-                    let (_, raw_depth) = scene.sort_self(view_proj_slice);
+                    let raw_depth = scene.raw_depths(view_proj_slice);
 
                     let t_data = TileBaseData {
                         splat_count: 0,
