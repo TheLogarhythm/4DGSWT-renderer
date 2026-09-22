@@ -320,6 +320,15 @@ impl State {
                 KeyCode::KeyP => {
                     rd.show_perf_menu = !rd.show_perf_menu;
                 }
+                KeyCode::KeyB => {
+                    if let Some(motion) = rd.motion.as_mut() {
+                        crate::motion_authoring_ui::toggle_panel(
+                            &mut rd.show_motion_authoring_menu,
+                            motion,
+                        );
+                        self.motion_brush_dragging = false;
+                    }
+                }
                 _ => {}
             }
         }

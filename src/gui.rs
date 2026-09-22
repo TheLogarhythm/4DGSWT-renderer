@@ -1245,7 +1245,7 @@ fn render_motion_summary_controls(ui: &mut egui::Ui, motion: &mut MotionRenderDa
     ui.end_row();
 
     ui.label("Motion editing");
-    let open_authoring = ui.button("Open Motion…").clicked();
+    let open_authoring = ui.button("Open Motion… (B)").clicked();
     ui.end_row();
 
     if let Some(error) = motion.error.as_deref() {

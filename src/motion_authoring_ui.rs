@@ -12,6 +12,11 @@ enum MotionScope {
     Local,
 }
 
+pub(crate) fn toggle_panel(open: &mut bool, motion: &mut MotionRenderData) {
+    crate::motion_brush_ui::stop_painting(motion);
+    *open = !*open;
+}
+
 pub fn show(context: &Context, open: &mut bool, motion: &mut MotionRenderData) {
     if !*open {
         crate::motion_brush_ui::stop_painting(motion);
@@ -728,6 +733,29 @@ mod tests {
                 .iter()
                 .filter(|text| text.as_str() == "Save session…")
                 .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn panel_toggle_finishes_paint_and_reopens_in_navigation_mode() {
+        let mut motion = fixture();
+        let runtime = motion.spatial.as_mut().unwrap();
+        runtime.set_enabled(true);
+        runtime.begin_stroke([0.0, 0.0]).unwrap();
+        let mut open = true;
+        toggle_panel(&mut open, &mut motion);
+        assert!(!open);
+        assert!(!motion.spatial.as_ref().unwrap().enabled);
+        assert_eq!(
+            motion.spatial.as_ref().unwrap().document().strokes().len(),
+            1
+        );
+        toggle_panel(&mut open, &mut motion);
+        assert!(open);
+        assert!(!motion.spatial.as_ref().unwrap().enabled);
+        assert_eq!(
+            motion.spatial.as_ref().unwrap().document().strokes().len(),
             1
         );
     }

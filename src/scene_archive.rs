@@ -11,9 +11,11 @@ use crate::motion::CanonicalGaussian;
 use crate::scene::{Scene, parse_tile_filename};
 
 const MIB: u64 = 1024 * 1024;
-const MAX_COMPRESSED_ARCHIVE_BYTES: u64 = 512 * MIB;
+// Accept larger six-LoD assets while retaining bounded ZIP input and expansion.
+// These are file-size budgets, not a guarantee of available CPU/GPU memory.
+const MAX_COMPRESSED_ARCHIVE_BYTES: u64 = 1024 * MIB;
 const MAX_DECOMPRESSED_ENTRY_BYTES: u64 = 256 * MIB;
-const MAX_DECOMPRESSED_ARCHIVE_BYTES: u64 = 1024 * MIB;
+const MAX_DECOMPRESSED_ARCHIVE_BYTES: u64 = 2048 * MIB;
 const MAX_ZIP_ENTRY_COUNT: usize = 512;
 const LOD_COUNT: usize = 6;
 
@@ -941,19 +943,35 @@ mod tests {
             "{member_error}"
         );
 
-        let aggregate_error = validate_declared_entry_sizes([
-            MAX_DECOMPRESSED_ENTRY_BYTES,
-            MAX_DECOMPRESSED_ENTRY_BYTES,
-            MAX_DECOMPRESSED_ENTRY_BYTES,
-            MAX_DECOMPRESSED_ENTRY_BYTES,
-            1,
-        ])
-        .unwrap_err();
+        let mut sizes = vec![
+            MAX_DECOMPRESSED_ENTRY_BYTES;
+            (MAX_DECOMPRESSED_ARCHIVE_BYTES / MAX_DECOMPRESSED_ENTRY_BYTES)
+                as usize
+        ];
+        assert!(validate_declared_entry_sizes(sizes.iter().copied()).is_ok());
+        sizes.push(1);
+        let aggregate_error = validate_declared_entry_sizes(sizes).unwrap_err();
         assert!(
             aggregate_error
                 .to_string()
                 .contains(&MAX_DECOMPRESSED_ARCHIVE_BYTES.to_string()),
             "{aggregate_error}"
         );
+    }
+
+    #[test]
+    fn accepts_windfarm_and_lava_archive_size_budgets() {
+        // Observed ZIP sizes, expanded totals, and member-size upper bounds. Check the
+        // size policy without allocating/decompressing gigabyte-sized fixtures.
+        for (compressed, expanded, largest) in [
+            (509_196_955_usize, 1_173_869_269_u64, 39 * super::MIB),
+            (589_073_772_usize, 1_364_755_222_u64, 47 * super::MIB),
+        ] {
+            assert!(validate_archive_input_size(compressed).is_ok());
+            let full_members = expanded / largest;
+            let sizes = std::iter::repeat_n(largest, full_members as usize)
+                .chain(std::iter::once(expanded % largest));
+            assert!(validate_declared_entry_sizes(sizes).is_ok());
+        }
     }
 }

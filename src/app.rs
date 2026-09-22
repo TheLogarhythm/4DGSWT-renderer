@@ -130,10 +130,15 @@ impl ApplicationHandler<State> for App {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state: key_state,
+                        repeat,
                         ..
                     },
                 ..
-            } => state.handle_key(event_loop, code, key_state.is_pressed()),
+            } => {
+                if !repeat || code != winit::keyboard::KeyCode::KeyB {
+                    state.handle_key(event_loop, code, key_state.is_pressed());
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => state.handle_mouse_moved(position),
             WindowEvent::MouseInput {
                 device_id: _,
