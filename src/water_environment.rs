@@ -78,14 +78,17 @@ impl WaterEnvironment {
     pub fn empty(device: &wgpu::Device) -> Self {
         Self::bind(device, &Self::texture(device, 1, 1))
     }
+}
 
-    pub fn from_sky(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        source: &crate::texture::Texture,
-        is_equi: bool,
-    ) -> Self {
-        let texture = Self::texture(device, Self::SIZE, Self::MIPS);
+/// Device resources shared by every sky replacement. The baked environment owns
+/// only its texture bindings, so changing sources does not recompile the shader.
+pub(crate) struct WaterEnvironmentBaker {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl WaterEnvironmentBaker {
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Water environment prefilter"),
             source: wgpu::ShaderSource::Wgsl(include_str!("water_environment.wgsl").into()),
@@ -116,15 +119,27 @@ impl WaterEnvironment {
             cache: None,
         });
         let layout = pipeline.get_bind_group_layout(0);
+        Self { pipeline, layout }
+    }
+
+    pub fn bake(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &crate::texture::Texture,
+        is_equi: bool,
+    ) -> WaterEnvironment {
+        let texture =
+            WaterEnvironment::texture(device, WaterEnvironment::SIZE, WaterEnvironment::MIPS);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Prefilter water sky once"),
         });
-        for mip in 0..Self::MIPS {
+        for mip in 0..WaterEnvironment::MIPS {
             for face in 0..6 {
                 let params = [
                     face as f32,
-                    (Self::SIZE >> mip) as f32,
-                    mip as f32 / (Self::MIPS - 1) as f32,
+                    (WaterEnvironment::SIZE >> mip) as f32,
+                    mip as f32 / (WaterEnvironment::MIPS - 1) as f32,
                     if is_equi { 1.0 } else { 0.0 },
                 ];
                 let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -134,7 +149,7 @@ impl WaterEnvironment {
                 });
                 let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &layout,
+                    layout: &self.layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -175,12 +190,12 @@ impl WaterEnvironment {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&pipeline);
+                pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &bind, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
         queue.submit(Some(encoder.finish()));
-        Self::bind(device, &texture)
+        WaterEnvironment::bind(device, &texture)
     }
 }

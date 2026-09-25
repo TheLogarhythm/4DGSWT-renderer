@@ -275,6 +275,7 @@ pub struct RenderData {
     pub fly_path_benchmark: bool,
 
     pub skybox_rawtex: Option<(SkyboxTexture, Vector2<usize>)>,
+    pub skybox_changed: bool,
     pub proxy_rawtex: Option<(Vec<Vec<f32>>, Vector2<usize>)>,
 
     pub depth_texture: Option<Texture>,
@@ -714,6 +715,7 @@ impl RenderData {
             fly_path_benchmark: false,
 
             skybox_rawtex: None,
+            skybox_changed: false,
             proxy_rawtex: None,
 
             depth_texture: None,

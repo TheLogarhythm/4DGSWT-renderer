@@ -6,6 +6,7 @@ use crate::camera::Camera;
 use crate::log; // macro import
 use crate::texture::Texture;
 use crate::utils::*;
+use crate::water_environment::{WaterEnvironment, WaterEnvironmentBaker};
 
 pub enum SkyboxTexture {
     Cubemap(Vec<Vec<f32>>),
@@ -30,7 +31,8 @@ pub struct Skybox {
     equi_bind_group_layout: wgpu::BindGroupLayout,
 
     is_equi: bool,
-    pub(crate) water_environment: Option<crate::water_environment::WaterEnvironment>,
+    pub(crate) water_environment: Option<WaterEnvironment>,
+    water_environment_baker: Option<WaterEnvironmentBaker>,
 }
 impl Skybox {
     const CUBEMAP_RESO: u32 = 2048; // Choose a resolution for each face
@@ -337,7 +339,23 @@ impl Skybox {
 
             is_equi: false,
             water_environment: None,
+            water_environment_baker: None,
         }
+    }
+
+    /// Reconfiguration may retain the CPU sky. Only a source replacement needs
+    /// another upload and reflection bake; missing initial resources still load.
+    pub(crate) fn configure_if_changed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &(SkyboxTexture, Vector2<usize>),
+        source_changed: bool,
+    ) {
+        if !source_changed && self.skybox_texture.is_some() && self.water_environment.is_some() {
+            return;
+        }
+        self.configure(device, queue, texture);
     }
 
     pub fn configure(
@@ -452,12 +470,11 @@ impl Skybox {
             label: Some("Skybox skybox_bind_group"),
         });
 
-        self.water_environment = Some(crate::water_environment::WaterEnvironment::from_sky(
-            device,
-            queue,
-            &skybox_texture,
-            self.is_equi,
-        ));
+        self.water_environment = Some(
+            self.water_environment_baker
+                .get_or_insert_with(|| WaterEnvironmentBaker::new(device))
+                .bake(device, queue, &skybox_texture, self.is_equi),
+        );
         self.skybox_texture = Some(skybox_texture);
         self.skybox_texture_bind_group = Some(skybox_texture_bind_group);
     }
@@ -705,6 +722,117 @@ impl Uniforms {
             view: (*cam.view()).into(),
             projection: (*cam.projection()).into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::gpu::{GpuTestContext, MissingGpu, read_texture_bytes};
+
+    #[test]
+    fn skybox_cache_reuses_unchanged_source_and_replaces_changed_source() {
+        let GpuTestContext { device, queue, .. } = GpuTestContext::new(
+            "skybox cache",
+            MissingGpu::Fail,
+            wgpu::PowerPreference::None,
+            crate::profiler::renderer_required_features,
+        )
+        .unwrap();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            width: 16,
+            height: 16,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("skybox cache test target"),
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let camera = Camera::new_perspective(
+            winit::dpi::PhysicalSize::new(16, 16),
+            vec3(0.0, 0.0, 1.0),
+            Vec3::zero(),
+            vec3(0.0, 1.0, 0.0),
+            degrees(60.0),
+            0.1,
+            100.0,
+        );
+        let render = |skybox: &Skybox| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            skybox.render(
+                &queue,
+                &mut encoder,
+                &target.create_view(&Default::default()),
+                &camera,
+            );
+            queue.submit(Some(encoder.finish()));
+            read_texture_bytes(&device, &queue, &target, [16, 16])
+        };
+        let mut skybox = Skybox::new(&device, &config);
+        let mut source = (
+            SkyboxTexture::Cubemap(vec![vec![0.2, 0.4, 0.6, 1.0]; 6]),
+            vec2(1, 1),
+        );
+        // An initial source must upload even when the caller has no dirty flag.
+        skybox.configure_if_changed(&device, &queue, &source, false);
+        let first_sky = skybox.skybox_texture.as_ref().unwrap().texture.clone();
+        let first_environment = skybox
+            .water_environment
+            .as_ref()
+            .unwrap()
+            .bind_group
+            .clone();
+        let first_frame = render(&skybox);
+        assert_eq!(&first_frame[..4], &[51, 102, 153, 255]);
+
+        skybox.configure_if_changed(&device, &queue, &source, false);
+        assert_eq!(
+            skybox.skybox_texture.as_ref().unwrap().texture,
+            first_sky,
+            "reconfiguring an unchanged sky reallocated its texture"
+        );
+        assert_eq!(
+            skybox.water_environment.as_ref().unwrap().bind_group,
+            first_environment,
+            "reconfiguring an unchanged sky rebuilt its reflection environment"
+        );
+        assert_eq!(render(&skybox), first_frame);
+
+        // Mutate the same allocation: address identity cannot detect this replacement.
+        let SkyboxTexture::Cubemap(faces) = &mut source.0 else {
+            unreachable!()
+        };
+        for face in faces {
+            face.copy_from_slice(&[0.8, 0.2, 0.4, 1.0]);
+        }
+        skybox.configure_if_changed(&device, &queue, &source, true);
+        assert_ne!(skybox.skybox_texture.as_ref().unwrap().texture, first_sky);
+        assert_ne!(
+            skybox.water_environment.as_ref().unwrap().bind_group,
+            first_environment
+        );
+        assert_eq!(&render(&skybox)[..4], &[204, 51, 102, 255]);
+
+        // A missing derived resource must recover even when the source is clean.
+        skybox.water_environment = None;
+        skybox.configure_if_changed(&device, &queue, &source, false);
+        assert!(skybox.water_environment.is_some());
+        assert_eq!(&render(&skybox)[..4], &[204, 51, 102, 255]);
     }
 }
 

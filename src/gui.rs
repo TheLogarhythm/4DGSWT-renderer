@@ -178,6 +178,7 @@ impl GUI {
                     if let Some(rx) = &channels.rx_skybox_tex {
                         if let Ok(skybox_tex) = rx.try_recv() {
                             rd.skybox_rawtex = Some(skybox_tex);
+                            rd.skybox_changed = true;
                             channels.rx_skybox_tex = None;
                         }
                     }

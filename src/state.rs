@@ -592,8 +592,13 @@ impl State {
                         }
                         if let Some(skybox_rawtex) = &self.render_data.skybox_rawtex {
                             self.render_data.use_skybox = true;
-                            self.skybox
-                                .configure(&self.device, &self.queue, skybox_rawtex);
+                            self.skybox.configure_if_changed(
+                                &self.device,
+                                &self.queue,
+                                skybox_rawtex,
+                                self.render_data.skybox_changed,
+                            );
+                            self.render_data.skybox_changed = false;
                         }
                         if let Some(proxy_rawtex) = &self.render_data.proxy_rawtex {
                             self.render_data.use_proxy = true;

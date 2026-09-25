@@ -112,7 +112,10 @@ the texture. Dry shaders exclude water clipping and fragment-depth output.
 
 GS contact uses conditional Gaussian depth; fine ripples affect only shading.
 Wave/ripple normals filter subpixel detail. Reflection uses a 256-pixel cubemap
-with nine GGX roughness levels (about 4 MiB), rebuilt with the skybox. It uses
+with nine GGX roughness levels (about 4 MiB), rebuilt only when the sky source
+changes or resources are missing. Scene reconfiguration reuses it. Set
+`RenderData::skybox_changed` when replacing `skybox_rawtex`; the upload path clears
+the flag after configuration. The prefilter pipeline survives sky replacements. It uses
 linearized displayed sky color; HDR has already been tone mapped.
 The geometric solver has a finite 16,384-step cap; grazing views, large coverage
 and short waves can increase cost or reach it.
