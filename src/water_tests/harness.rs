@@ -24,6 +24,8 @@ pub(super) struct Harness {
     pub proxy: Option<crate::proxy::Proxy>,
     pub motion_time: Option<f32>,
     pub skybox: crate::skybox::Skybox,
+    // Reference path for verifying that removing the overwritten background preserves pixels.
+    pub legacy_background: bool,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -125,6 +127,7 @@ impl Harness {
             device,
             queue,
             skybox,
+            legacy_background: false,
             target,
             gs,
             water,
@@ -203,7 +206,7 @@ impl Harness {
                 }),
             },
         );
-        {
+        if self.legacy_background || !(water_drawn && underwater.is_some()) {
             if self.data.use_skybox {
                 self.skybox
                     .render(&self.queue, encoder, &view, &self.camera);

@@ -26,6 +26,12 @@ pub(crate) struct Uniforms {
 }
 
 impl Uniforms {
+    /// The volume shader never reads receiver caustics. Exclude them from its cache key.
+    pub fn volume_key(mut self) -> Self {
+        self.caustics = [0.0; 4];
+        self
+    }
+
     pub fn new(
         camera: &Camera,
         water: &WaterSettings,

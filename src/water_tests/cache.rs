@@ -1,6 +1,156 @@
 //! Cache validity, pixel centers, full precision, resize and miss overwrite.
 use super::harness::Harness;
 use crate::{test_support::gpu::read_texture_bytes, utils::*};
+
+#[test]
+fn underwater_single_background_matches_the_overwritten_sky_across_the_waterline() {
+    let mut h = Harness::new();
+    h.skybox.configure(
+        &h.device,
+        &h.queue,
+        &(
+            crate::skybox::SkyboxTexture::Cubemap(vec![vec![0.2, 0.4, 0.8, 1.0]; 6]),
+            vec2(1, 1),
+        ),
+    );
+    h.data.render_config.water.enabled = true;
+    h.data.render_config.water.underwater.enabled = true;
+    h.data.render_config.water.amplitude = 0.14;
+    for sky in [false, true] {
+        h.data.use_skybox = sky;
+        for z in [2.0, 0.2, 0.025, -0.025, -0.2, -2.0] {
+            h.camera
+                .set_view(vec3(0.0, -2.0, z), vec3(0.0, 2.0, z), vec3(0.0, 0.0, 1.0));
+            h.legacy_background = true;
+            let reference = h.frame();
+            h.legacy_background = false;
+            assert_eq!(
+                h.frame(),
+                reference,
+                "background changed at z={z}, sky={sky}"
+            );
+        }
+    }
+}
+
+#[test]
+fn underwater_toggles_preserve_the_viewport_hit_texture() {
+    let mut h = Harness::new();
+    h.data.render_config.water.enabled = true;
+    h.data.render_config.water.height = 3.0;
+    h.camera
+        .set_view(vec3(0.0, -2.0, 0.0), Vec3::zero(), vec3(0.0, 0.0, 1.0));
+    h.frame();
+    let hits = h.water.hits().unwrap().texture.clone();
+    h.data.render_config.water.underwater.enabled = true;
+    h.frame();
+    assert_eq!(
+        hits,
+        h.water.hits().unwrap().texture,
+        "entering water reallocated unchanged viewport hits"
+    );
+    let volume = h.water.hits().unwrap().volume_texture.clone();
+    for enabled in [true, false, true] {
+        h.data.render_config.water.underwater.caustics = enabled;
+        h.frame();
+        assert_eq!(
+            hits,
+            h.water.hits().unwrap().texture,
+            "caustics reallocated unrelated hits"
+        );
+        assert_eq!(
+            volume,
+            h.water.hits().unwrap().volume_texture,
+            "caustics reallocated the scattering volume"
+        );
+    }
+    h.data.render_config.water.underwater.enabled = false;
+    h.frame();
+    assert_eq!(
+        hits,
+        h.water.hits().unwrap().texture,
+        "leaving water reallocated unchanged viewport hits"
+    );
+}
+
+#[test]
+fn underwater_static_preparation_is_reused_while_caustics_keep_animating() {
+    let mut h = Harness::new();
+    h.camera
+        .set_view(vec3(0.0, -2.0, 0.0), Vec3::zero(), vec3(0.0, 0.0, 1.0));
+    h.data.render_config.water.enabled = true;
+    h.data.render_config.water.height = 3.0;
+    h.data.render_config.water.speed = 0.0;
+    h.data.render_config.water.underwater.enabled = true;
+    let first = h.frame();
+    assert_eq!(h.water.preparation_dispatches, [1, 1]);
+    assert_eq!(h.frame(), first);
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [1, 1],
+        "unchanged camera/medium repeated GPU preparation"
+    );
+    h.data.render_config.water.underwater.caustics = true;
+    h.data.render_config.water.advance(1.0);
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [1, 1],
+        "caustic animation invalidated the independent volume"
+    );
+    h.data.render_config.water.underwater.sun_azimuth += 10.0;
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [1, 2],
+        "lighting must only invalidate scattering"
+    );
+    h.camera
+        .set_view(vec3(0.0, -2.2, 0.0), Vec3::zero(), vec3(0.0, 0.0, 1.0));
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [2, 3],
+        "camera must invalidate both textures"
+    );
+    h.data.render_config.water.underwater.visibility = 30.0;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [2, 4]);
+    h.data.render_config.water.underwater.clear_distance = 5.0;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [2, 5]);
+    h.data.render_config.water.height = 4.0;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [3, 6]);
+    h.data.render_config.water.amplitude = 0.1;
+    h.data.render_config.water.speed = 1.0;
+    h.data.render_config.water.advance(0.2);
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [4, 7]);
+    h.data.cur_scene_data.as_mut().unwrap().center_coord.x += 1;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [5, 8]);
+    h.camera
+        .set_perspective_projection(degrees(50.0), 0.05, 200.0);
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [6, 9]);
+    h.resize([65, 33]);
+    let cached = h.frame();
+    assert_eq!(h.water.preparation_dispatches, [7, 10]);
+    // Profiling a reused frame must still write all query pairs (some backends
+    // otherwise wait forever when resolving unwritten timestamps).
+    if let Some(times) = h.time_passes_ms() {
+        assert!(times.iter().all(|t| t.is_finite() && *t >= 0.0));
+        assert_eq!(h.water.preparation_dispatches, [7, 10]);
+    }
+    h.water = crate::water::WaterRenderer::new(&h.device, h.config.format);
+    assert_eq!(
+        h.frame(),
+        cached,
+        "cached output differs from a fresh renderer"
+    );
+}
+
 #[test]
 fn water_cache_refreshes_pixels_after_camera_phase_and_viewport_changes() {
     let mut h = Harness::new();

@@ -1,4 +1,5 @@
 //! Viewport-sized hits and optional scattering volume, sharing stable sampling resources.
+//! Resizing, entering water and enabling caustics have independent allocation lifetimes.
 pub(crate) struct WaterResources {
     read_layout: wgpu::BindGroupLayout,
     write_layout: wgpu::BindGroupLayout,
@@ -244,6 +245,32 @@ impl WaterHits {
             size,
             volume_size,
         }
+    }
+
+    /// Returns which computed textures were replaced and therefore need fresh contents.
+    pub fn configure(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        underwater: bool,
+        resources: &WaterResources,
+        bindings_changed: bool,
+    ) -> (bool, bool) {
+        let hits_changed = self.size != size;
+        let volume_size = Self::volume_size(size, underwater);
+        let volume_changed = self.volume_size != volume_size;
+        if hits_changed {
+            self.texture = Self::hit_texture(device, size);
+            self.size = size;
+        }
+        if volume_changed {
+            self.volume_texture = Self::volume_texture(device, volume_size);
+            self.volume_size = volume_size;
+        }
+        if hits_changed || volume_changed || bindings_changed {
+            (self.read, self.write) = resources.bind(device, &self.texture, &self.volume_texture);
+        }
+        (hits_changed, volume_changed)
     }
 
     fn volume_size(size: [u32; 2], underwater: bool) -> [u32; 3] {

@@ -240,6 +240,17 @@ struct Uniforms {
     underwater_color: [f32; 4],
 }
 
+/// Only geometric inputs affect the full-resolution intersection cache.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct IntersectionInputs {
+    camera: CameraUniforms,
+    bounds: [f32; 4],
+    level: [f32; 4],
+    waves: [f32; 4],
+    phases: [f32; 4],
+}
+
 /// Uses the committed tile window, including a one-tile border around its footprint.
 /// Moving the cache changes only coverage, never the world-space water level.
 pub(crate) fn bounds(user: &UserData, data: &RenderData) -> Option<[f32; 4]> {
@@ -263,7 +274,10 @@ pub struct WaterRenderer {
     background_pipeline: wgpu::RenderPipeline,
     hits: Option<WaterHits>,
     resources: Option<WaterResources>,
-    caustics_enabled: bool,
+    last_intersection: Option<IntersectionInputs>,
+    last_volume: Option<crate::underwater::Uniforms>,
+    #[cfg(test)]
+    pub(crate) preparation_dispatches: [u64; 2],
 }
 impl WaterRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -431,7 +445,10 @@ impl WaterRenderer {
             background_pipeline,
             hits: None,
             resources: None,
-            caustics_enabled: false,
+            last_intersection: None,
+            last_volume: None,
+            #[cfg(test)]
+            preparation_dispatches: [0; 2],
             pipeline,
             uniforms,
             bind_group,
@@ -446,6 +463,8 @@ impl WaterRenderer {
     pub(crate) fn release_underwater(&mut self) {
         if self.hits.as_ref().is_some_and(|h| h.volume_size[2] > 1) {
             self.hits = None;
+            self.last_intersection = None;
+            self.last_volume = None;
         }
     }
 
@@ -527,43 +546,83 @@ impl WaterRenderer {
         let resources = self
             .resources
             .get_or_insert_with(|| WaterResources::new(device, queue));
-        resources.ensure_caustics(device, queue, caustics_enabled);
-        if self.hits.as_ref().is_none_or(|h| {
-            h.size != size
-                || (h.volume_size[2] > 1) != underwater.is_some()
-                || self.caustics_enabled != caustics_enabled
-        }) {
+        let bindings_changed = resources.ensure_caustics(device, queue, caustics_enabled);
+        let (hits_replaced, volume_replaced) = if let Some(hits) = self.hits.as_mut() {
+            hits.configure(
+                device,
+                size,
+                underwater.is_some(),
+                resources,
+                bindings_changed,
+            )
+        } else {
             self.hits = Some(WaterHits::new(
                 device,
                 size,
                 underwater.is_some(),
                 resources,
             ));
-        }
-        self.caustics_enabled = caustics_enabled;
+            (true, true)
+        };
         let hits = self.hits.as_ref().unwrap();
-        if let Some(frame) = underwater {
+        let intersection = IntersectionInputs {
+            camera: uniforms.camera,
+            bounds,
+            level: [settings.height, 0.0, 0.0, 0.0],
+            waves: uniforms.waves,
+            phases: uniforms.phases,
+        };
+        let update_hits = hits_replaced
+            || self
+                .last_intersection
+                .as_ref()
+                .is_none_or(|last| bytemuck::bytes_of(last) != bytemuck::bytes_of(&intersection));
+        let volume = underwater.map(|frame| {
             let medium = crate::underwater::Uniforms::new(camera, settings, frame, bounds);
+            // Receiver animation must remain live even when both compute caches are reused.
             queue.write_buffer(&resources.medium_uniforms, 0, bytemuck::bytes_of(&medium));
-        }
-        {
+            medium.volume_key()
+        });
+        let update_volume = volume.as_ref().is_some_and(|key| {
+            volume_replaced
+                || self
+                    .last_volume
+                    .as_ref()
+                    .is_none_or(|last| bytemuck::bytes_of(last) != bytemuck::bytes_of(key))
+        });
+
+        // The textures depend on camera/water inputs, never on changing GS layers or proxy depth.
+        // A timestamp-only pass keeps both queries valid when profiling a cache hit.
+        if update_hits || update_volume || timestamps.intersection.is_some() {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Water preparation"),
                 timestamp_writes: timestamps.intersection,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &hits.write, &[]);
-            pass.set_pipeline(&self.intersect_pipeline);
-            pass.dispatch_workgroups(size[0].div_ceil(8), size[1].div_ceil(8), 1);
-            if underwater.is_some() {
+            if update_hits {
+                pass.set_pipeline(&self.intersect_pipeline);
+                pass.dispatch_workgroups(size[0].div_ceil(8), size[1].div_ceil(8), 1);
+                #[cfg(test)]
+                {
+                    self.preparation_dispatches[0] += 1;
+                }
+            }
+            if update_volume {
                 pass.set_pipeline(&self.scattering_pipeline);
                 pass.dispatch_workgroups(
                     hits.volume_size[0].div_ceil(8),
                     hits.volume_size[1].div_ceil(8),
                     1,
                 );
+                #[cfg(test)]
+                {
+                    self.preparation_dispatches[1] += 1;
+                }
             }
         }
+        self.last_intersection = Some(intersection);
+        self.last_volume = volume;
         true
     }
 
@@ -580,7 +639,7 @@ impl WaterRenderer {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
             })],

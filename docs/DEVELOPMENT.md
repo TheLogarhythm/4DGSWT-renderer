@@ -121,6 +121,11 @@ Profiler readback uses a four-buffer asynchronous ring; a busy ring drops sample
 instead of blocking rendering. CPU preparation/submission and GPU timings have
 different scopes; see [water benchmark evidence](water-performance.md).
 
+Water preparation now reuses unchanged intersection/scattering textures. Fixed-camera,
+fixed-phase benchmarks measure this cached case; advance the water clock or move the
+camera when measuring animated preparation cost. Caustic offsets alone do not
+invalidate the scattering volume.
+
 ## Validation
 
 Run from the renderer directory; GPU tests should run serially:

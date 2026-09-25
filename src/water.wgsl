@@ -182,7 +182,7 @@ fn vs_underwater_background(@builtin(vertex_index) index: u32) -> @builtin(posit
 fn fs_underwater_background(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     let ray = normalize(water_ray(pixel.xy, water.camera));
     var sky = vec3(0.0);
-    if water.level.y > 0.5 {
+    if water.level.y > 0.5 && water.underwater_color.a < 1.0 {
         sky = pow(max(textureSampleLevel(environment, environment_sampler, ray, 0.0).rgb, vec3(0.0)), vec3(1.0 / 2.2));
     }
     // Missing tiles are distant water, not a view of air through the edge of the

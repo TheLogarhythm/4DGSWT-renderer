@@ -156,6 +156,10 @@ the accumulated scattering at its own view depth before normal alpha blending;
 proxy ground and the underside use the same volume. This preserves transparent
 edges without an opaque coral-depth prepass. Large splats still approximate
 depth by their center, and interpolate lighting across their projected quad.
+Intersection and scattering textures are reused while their inputs are unchanged.
+Camera, wave, coverage or medium changes refresh the affected cache; caustic
+animation updates its sampling offsets without invalidating either texture.
+The underwater background replaces the ordinary sky pass, including at the waterline.
 
 Light shafts use sparse artificial light columns with bright cores and dark gaps,
 anchored in world space along the sunlight direction. Their placement does not
@@ -176,13 +180,17 @@ pattern position; Water pause/global Freeze still pauses the animation.
 It works with flat water and with light shafts disabled. The option defaults off;
 disabled/above-water paths skip caustic sampling. A one-texel placeholder is used
 until first enablement; the small cookie then stays resident through toggles,
-viewport resizing and water reentry. GS samples at its world center with footprint filtering, so large splats soften
+viewport resizing and water reentry. Toggling caustics does not reallocate the
+intersection or scattering textures.
+GS samples at its world center with footprint filtering, so large splats soften
 fine lines. This is illumination of baked GS colors, not physical relighting:
 normal-dependent focusing and coral shadows are not modeled, and highlights can
 reach surfaces that would be shadowed. Increase **Caustic scale** for coarse LoDs.
 
 The profiler's **GPU water preparation** includes both intersection and optional
 scattering integration. **GPU water shading** measures the surface pass.
+On unchanged frames, preparation records only a timestamp boundary when profiling
+is enabled; neither compute shader is dispatched.
 
 ## Performance and diagnostics
 

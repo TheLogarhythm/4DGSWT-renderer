@@ -978,7 +978,16 @@ impl State {
                         }
                         false
                     };
-                    if rd.use_skybox {
+                    if water_drawn && underwater.is_some() {
+                        self.water.as_ref().unwrap().render_background(
+                            &mut encoder,
+                            &view,
+                            self.skybox
+                                .water_environment
+                                .as_ref()
+                                .filter(|_| rd.use_skybox),
+                        );
+                    } else if rd.use_skybox {
                         self.skybox
                             .render(&self.queue, &mut encoder, &view, &self.camera);
                     } else {
@@ -1007,16 +1016,6 @@ impl State {
                         });
                     }
 
-                    if water_drawn && underwater.is_some() {
-                        self.water.as_ref().unwrap().render_background(
-                            &mut encoder,
-                            &view,
-                            self.skybox
-                                .water_environment
-                                .as_ref()
-                                .filter(|_| rd.use_skybox),
-                        );
-                    }
                     if rd.use_proxy {
                         self.proxy.render_with_water(
                             &self.queue,
