@@ -8,9 +8,11 @@ use crate::log;
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
+use crate::water;
 
 pub struct Proxy {
     render_pipeline: wgpu::RenderPipeline,
+    underwater_render_pipeline: wgpu::RenderPipeline,
 
     full_vertex_buffer: wgpu::Buffer,
     map_vertex_buffer: Option<wgpu::Buffer>,
@@ -86,7 +88,11 @@ impl Proxy {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Proxy Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("proxy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(proxy_shader_source(false).into()),
+        });
+        let underwater_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater Proxy Shader"),
+            source: wgpu::ShaderSource::Wgsl(proxy_shader_source(true).into()),
         });
 
         let render_pipeline_layout =
@@ -131,6 +137,52 @@ impl Proxy {
             multiview: None,
             cache: None,
         });
+        let underwater_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Underwater Proxy Pipeline"),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Underwater proxy layout"),
+                        bind_group_layouts: &[
+                            &uniforms_bind_group_layout,
+                            &texture_bind_group_layout,
+                            &crate::water_hits::WaterHits::read_layout(device),
+                        ],
+                        push_constant_ranges: &[],
+                    }),
+                ),
+                vertex: wgpu::VertexState {
+                    module: &underwater_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &underwater_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Texture::DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
 
         // Vertex buffer
         let mut triangle_vertices: Vec<Vertex> =
@@ -190,6 +242,7 @@ impl Proxy {
 
         Self {
             render_pipeline,
+            underwater_render_pipeline,
 
             full_vertex_buffer,
             map_vertex_buffer: None,
@@ -371,6 +424,37 @@ impl Proxy {
         camera: &Camera,
         render_data: &RenderData,
     ) {
+        self.render_with_water(queue, encoder, view, camera, render_data, None);
+    }
+
+    pub(crate) fn render_with_water(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        camera: &Camera,
+        render_data: &RenderData,
+        water_hits: Option<&wgpu::BindGroup>,
+    ) {
+        let underwater = if render_data
+            .render_config
+            .water
+            .is_active(self.user_data.surface_type)
+            && water_hits.is_some()
+        {
+            let position = camera.position();
+            render_data.render_config.water.underwater_frame(
+                [position.x, position.y, position.z],
+                water::bounds(&self.user_data, render_data),
+            )
+        } else {
+            None
+        };
+        let pipeline = if underwater.is_some() {
+            &self.underwater_render_pipeline
+        } else {
+            &self.render_pipeline
+        };
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -394,6 +478,9 @@ impl Proxy {
             timestamp_writes: None,
         });
 
+        if underwater.is_some() {
+            render_pass.set_bind_group(2, water_hits.unwrap(), &[]);
+        }
         if render_data.render_config.proxy_full {
             queue.write_buffer(
                 &self.uniforms_buffer,
@@ -407,7 +494,7 @@ impl Proxy {
                 )),
             );
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.uniforms_bind_group, &[0]);
             render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.full_vertex_buffer.slice(..));
@@ -429,7 +516,7 @@ impl Proxy {
                 )),
             );
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(
                 0,
                 &self.uniforms_bind_group,
@@ -508,6 +595,34 @@ impl Uniforms {
             cam_pos: (*cam.position()).extend(0.0).into(),
         }
     }
+}
+
+fn proxy_shader_source(underwater: bool) -> String {
+    let source = include_str!("proxy.wgsl");
+    if underwater {
+        return [
+            include_str!("camera.wgsl"),
+            &crate::underwater::sampling_shader(2),
+            source,
+        ]
+        .concat();
+    }
+    let mut output = String::new();
+    let mut skipping = false;
+    for line in source.lines() {
+        if line.trim_start().starts_with("// UNDERWATER_BEGIN:") {
+            assert!(!skipping);
+            skipping = true;
+        } else if line.trim_start().starts_with("// UNDERWATER_END:") {
+            assert!(skipping);
+            skipping = false;
+        } else if !skipping {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    assert!(!skipping, "underwater proxy shader block must be closed");
+    output
 }
 
 pub fn upload_proxy_texture() -> mpsc::Receiver<(Vec<Vec<f32>>, Vector2<usize>)> {

@@ -6,6 +6,7 @@ use winit::event_loop::EventLoop;
 
 mod app;
 mod camera;
+mod caustics;
 mod control;
 mod dynamic_archive;
 mod gui;
@@ -34,6 +35,7 @@ mod skybox;
 mod state;
 mod structure;
 mod texture;
+mod underwater;
 mod utils;
 mod wangtile;
 mod water;

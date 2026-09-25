@@ -75,6 +75,51 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 }
+
+fn water_to_air_transmission(cosine: f32) -> f32 {
+    let eta = 1.333;
+    let cos_i = clamp(cosine, 0.0, 1.0);
+    let sin_t2 = eta * eta * (1.0 - cos_i * cos_i);
+    if sin_t2 >= 1.0 { return 0.0; }
+    let cos_t = sqrt(max(1.0 - sin_t2, 0.0));
+    let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+    let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    return 1.0 - 0.5 * (rs * rs + rp * rp);
+}
+
+// View from water into air: refracted sky is visible inside Snell's window.
+// Outside it, total internal reflection sees the underwater medium, not the sky.
+// Without a scene-reflection pass, use the far-water radiance for that reflection.
+fn underwater_surface_color(incident: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>, view_depth: f32, lod: f32) -> vec3<f32> {
+    let eta = 1.333;
+    let cos_i = clamp(dot(-incident, normal), 0.0, 1.0);
+    // Continuous angular filtering approximates rough-facet transmission near
+    // the critical angle without the visible bands of a few discrete normal taps.
+    let critical_cos = sqrt(1.0 - 1.0 / (eta * eta));
+    let spread = max(water.material.y * 0.25, 0.0001);
+    let window = smoothstep(critical_cos - spread, critical_cos + spread, cos_i);
+    let sky_weight = window * water_to_air_transmission(max(cos_i, critical_cos + spread * 0.6));
+    // Approximate the reflected underwater environment separately from the top
+    // material. Upward-facing reflected directions receive more ambient light.
+    let reflected_direction = reflect(incident, normal);
+    var interface_color = water.underwater_color.rgb * (0.85 + 0.15 * max(reflected_direction.z, 0.0));
+    if sky_weight > 0.0 {
+        // For rough facets just beyond the mean critical angle, use the tangent
+        // direction of the transmitted lobe rather than a zero refraction vector.
+        let sin_t2 = min(eta * eta * (1.0 - cos_i * cos_i), 0.9999);
+        let tangent = incident + normal * cos_i;
+        let transmitted = tangent / max(length(tangent), 1e-5) * sqrt(sin_t2) - normal * sqrt(1.0 - sin_t2);
+        // A neutral daylight fallback also works when no environment is loaded.
+        var sky = vec3(0.70, 0.82, 0.86);
+        if water.level.y > 0.5 {
+            let sky_linear = textureSampleLevel(environment, environment_sampler, transmitted, lod).rgb;
+            sky = pow(max(sky_linear, vec3(0.0)), vec3(1.0 / 2.2));
+        }
+        interface_color = mix(interface_color, sky, sky_weight);
+    }
+    return underwater_compose(interface_color, pixel, view_depth);
+}
+
 @fragment
 fn fs_main(@builtin(position) pixel: vec4<f32>) -> FragmentOutput {
     let hit = load_water_hit(pixel.xy);
@@ -97,6 +142,14 @@ fn fs_main(@builtin(position) pixel: vec4<f32>) -> FragmentOutput {
     let reflected = reflect(-view,normal);
     let angular_footprint = max(length(dpdx(reflected)),length(dpdy(reflected)));
     if hit.y < 0.5 { discard; }
+    if water.level.z > 0.5 && water.underwater_color.a > 0.0 {
+        let filtered_roughness = sqrt(max(water.material.y*water.material.y,angular_footprint*0.5));
+        let lod = clamp(filtered_roughness*8.0,0.0,8.0);
+        let inward = -normalize(vec3(-slope, 1.0));
+        let below_normal = faceForward(inward, normalize(ray), inward);
+        let color = underwater_surface_color(normalize(ray), below_normal, pixel.xy, distance, lod);
+        return FragmentOutput(vec4(color, 1.0), hit.x);
+    }
     let light = normalize(vec3(-0.6,-0.4,1.0));
     // Preserve the previous diagnostic appearance for a useful all-effects-off A/B.
     let diffuse_strength = mix(2.0,0.35,water.material.x);
@@ -118,4 +171,25 @@ fn fs_main(@builtin(position) pixel: vec4<f32>) -> FragmentOutput {
     out.color = vec4(color,1.0);
     out.depth = hit.x;
     return out;
+}
+
+@vertex
+fn vs_underwater_background(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let xy = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+    return vec4(xy[index], 0.0, 1.0);
+}
+@fragment
+fn fs_underwater_background(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
+    let ray = normalize(water_ray(pixel.xy, water.camera));
+    var sky = vec3(0.0);
+    if water.level.y > 0.5 {
+        sky = pow(max(textureSampleLevel(environment, environment_sampler, ray, 0.0).rgb, vec3(0.0)), vec3(1.0 / 2.2));
+    }
+    // Missing tiles are distant water, not a view of air through the edge of the
+    // loaded window. Real air transmission is drawn by the interface pass.
+    let depth = max(water.level.x - water.camera.cam_pos.z, 0.0);
+    let brightness = 0.28 + 0.72 * exp(-depth / underwater_params.lighting.y);
+    let distant_water = water.underwater_color.rgb * pow(brightness, 1.0 / 2.2);
+    let color = underwater_compose(distant_water, pixel.xy, underwater_params.range.x);
+    return vec4(mix(sky, color, water.underwater_color.a), 1.0);
 }

@@ -27,6 +27,8 @@ pub struct GSWTRenderer {
     motion_field_render_pipeline: wgpu::RenderPipeline,
     water_render_pipeline: wgpu::RenderPipeline,
     water_motion_field_render_pipeline: wgpu::RenderPipeline,
+    underwater_render_pipeline: wgpu::RenderPipeline,
+    underwater_motion_field_render_pipeline: wgpu::RenderPipeline,
     empty_water_base_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
 
@@ -203,7 +205,7 @@ impl GSWTRenderer {
                 ],
             });
 
-        let motion_field_shader_source = gs_shader_source(false);
+        let motion_field_shader_source = gs_shader_source(false, false);
         let base_shader_source = strip_motion_field_shader_blocks(&motion_field_shader_source);
         let base_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Base GSWT shader"),
@@ -214,7 +216,7 @@ impl GSWTRenderer {
             source: wgpu::ShaderSource::Wgsl(motion_field_shader_source.into()),
         });
 
-        let wet_source = gs_shader_source(true);
+        let wet_source = gs_shader_source(true, false);
         let wet_base = strip_motion_field_shader_blocks(&wet_source);
         let wet_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Water-clipped GS shader"),
@@ -224,6 +226,17 @@ impl GSWTRenderer {
             label: Some("Water-clipped authored shader"),
             source: wgpu::ShaderSource::Wgsl(wet_source.into()),
         });
+        let underwater_source = gs_shader_source(true, true);
+        let underwater_base = strip_motion_field_shader_blocks(&underwater_source);
+        let underwater_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater GS shader"),
+            source: wgpu::ShaderSource::Wgsl(underwater_base.into()),
+        });
+        let underwater_authored_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Underwater authored GS shader"),
+                source: wgpu::ShaderSource::Wgsl(underwater_source.into()),
+            });
         let base_render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Base render pipeline layout"),
@@ -304,6 +317,22 @@ impl GSWTRenderer {
             &water_authored_layout,
             &wet_authored_shader,
             "Water-clipped authored GS pipeline",
+            wgpu::CompareFunction::LessEqual,
+        );
+        let underwater_render_pipeline = create_render_pipeline(
+            device,
+            config.format,
+            &water_base_layout,
+            &underwater_shader,
+            "Underwater GS pipeline",
+            wgpu::CompareFunction::LessEqual,
+        );
+        let underwater_motion_field_render_pipeline = create_render_pipeline(
+            device,
+            config.format,
+            &water_authored_layout,
+            &underwater_authored_shader,
+            "Underwater authored GS pipeline",
             wgpu::CompareFunction::LessEqual,
         );
 
@@ -501,6 +530,8 @@ impl GSWTRenderer {
             empty_water_base_group,
             water_render_pipeline,
             water_motion_field_render_pipeline,
+            underwater_render_pipeline,
+            underwater_motion_field_render_pipeline,
             vertex_buffer,
 
             camera_uniforms_buffer,
@@ -969,7 +1000,19 @@ impl GSWTRenderer {
         let sort_data = render_data.cur_sort_data.as_ref().unwrap();
         let render_config = &render_data.render_config;
         let profiling = render_data.profiler_enabled;
-
+        let water_bounds = crate::water::bounds(&self.user_data, render_data);
+        let water_active = water_hits.is_some()
+            && render_config.water.is_active(self.user_data.surface_type)
+            && water_bounds.is_some();
+        let underwater = if water_active {
+            let position = camera.position();
+            render_config
+                .water
+                .underwater_frame([position.x, position.y, position.z], water_bounds)
+        } else {
+            None
+        };
+        let underwater_active = underwater.is_some();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1048,10 +1091,9 @@ impl GSWTRenderer {
                     && key.scene_id == scene_data.scene_id
             });
         let mut using_motion_pipeline = false;
-        let water_active = water_hits.is_some()
-            && render_config.water.is_active(self.user_data.surface_type)
-            && crate::water::bounds(&self.user_data, render_data).is_some();
-        render_pass.set_pipeline(if water_active {
+        render_pass.set_pipeline(if underwater_active {
+            &self.underwater_render_pipeline
+        } else if water_active {
             &self.water_render_pipeline
         } else {
             &self.render_pipeline
@@ -1123,12 +1165,17 @@ impl GSWTRenderer {
                 );
             if requires_motion_pipeline != using_motion_pipeline {
                 using_motion_pipeline = requires_motion_pipeline;
-                render_pass.set_pipeline(match (using_motion_pipeline, water_active) {
-                    (true, true) => &self.water_motion_field_render_pipeline,
-                    (true, false) => &self.motion_field_render_pipeline,
-                    (false, true) => &self.water_render_pipeline,
-                    (false, false) => &self.render_pipeline,
-                });
+                render_pass.set_pipeline(
+                    match (using_motion_pipeline, water_active, underwater_active) {
+                        (true, true, true) => &self.underwater_motion_field_render_pipeline,
+                        (false, true, true) => &self.underwater_render_pipeline,
+                        (true, true, false) => &self.water_motion_field_render_pipeline,
+                        (true, false, false) => &self.motion_field_render_pipeline,
+                        (false, true, false) => &self.water_render_pipeline,
+                        (false, false, false) => &self.render_pipeline,
+                        (_, false, true) => unreachable!("underwater requires water"),
+                    },
+                );
                 render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 if using_motion_pipeline {
                     render_pass.set_bind_group(
@@ -1278,24 +1325,50 @@ fn strip_motion_field_shader_blocks(source: &str) -> String {
 }
 
 /// Dry pipelines are compiled without water varyings, cut moments, solver or depth output.
-fn gs_shader_source(water: bool) -> String {
+fn gs_shader_source(water: bool, underwater: bool) -> String {
+    assert!(water || !underwater, "underwater rendering requires water");
+    let mut body = if water {
+        include_str!("gswt.wgsl").to_owned()
+    } else {
+        strip_tagged_shader_blocks(include_str!("gswt.wgsl"), "WATER")
+    };
+    if !underwater {
+        body = strip_tagged_shader_blocks(&body, "UNDERWATER");
+    }
     if water {
-        return [
+        [
             include_str!("camera.wgsl"),
             &crate::water_hits::shader_source(3),
-            include_str!("gswt.wgsl"),
+            &if underwater {
+                crate::underwater::sampling_shader(3)
+            } else {
+                String::new()
+            },
+            &body,
         ]
-        .concat();
+        .concat()
+    } else {
+        [
+            include_str!("camera.wgsl"),
+            &body,
+            include_str!("gswt_dry.wgsl"),
+        ]
+        .concat()
     }
+}
+
+fn strip_tagged_shader_blocks(source: &str, tag: &str) -> String {
     let mut body = String::new();
     let mut skipping = false;
-    for line in include_str!("gswt.wgsl").lines() {
-        if line.trim_start().starts_with("// WATER_BEGIN:") {
+    let begin = format!("// {tag}_BEGIN:");
+    let end = format!("// {tag}_END:");
+    for line in source.lines() {
+        if line.trim_start().starts_with(&begin) {
             assert!(!skipping);
             skipping = true;
             continue;
         }
-        if line.trim_start().starts_with("// WATER_END:") {
+        if line.trim_start().starts_with(&end) {
             assert!(skipping);
             skipping = false;
             continue;
@@ -1305,13 +1378,8 @@ fn gs_shader_source(water: bool) -> String {
             body.push('\n');
         }
     }
-    assert!(!skipping, "water shader block must be closed");
-    [
-        include_str!("camera.wgsl"),
-        &body,
-        include_str!("gswt_dry.wgsl"),
-    ]
-    .concat()
+    assert!(!skipping, "{tag} shader block must be closed");
+    body
 }
 
 fn create_render_pipeline(
@@ -2051,7 +2119,7 @@ mod tests {
             trace: wgpu::Trace::Off,
         }))
         .unwrap();
-        let authored = gs_shader_source(true);
+        let authored = gs_shader_source(true, false);
         let base = strip_motion_field_shader_blocks(&authored);
         assert!(!base.contains("@group(2)"));
         assert!(!base.contains("u_motion_field"));
@@ -2070,7 +2138,7 @@ mod tests {
     }
     #[test]
     fn dry_gs_shader_has_no_water_depth_or_intersection_work() {
-        let source = strip_motion_field_shader_blocks(&gs_shader_source(false));
+        let source = strip_motion_field_shader_blocks(&gs_shader_source(false, false));
         assert!(
             !source.contains("@builtin(frag_depth)"),
             "disabled water must use a color-only fragment shader"
@@ -2086,7 +2154,7 @@ mod tests {
     }
     #[test]
     fn water_gs_shader_reads_shared_hits_without_solver() {
-        let source = gs_shader_source(true);
+        let source = gs_shader_source(true, false);
         assert!(
             !source.contains("fn water_surface_hit("),
             "GS must not compile the iterative water solver"
@@ -2095,5 +2163,16 @@ mod tests {
             source.contains("load_water_hit("),
             "GS must consume the current frame's shared hit texture"
         );
+    }
+
+    #[test]
+    fn underwater_shader_is_a_separate_water_only_variant() {
+        let dry = gs_shader_source(false, false);
+        let wet = gs_shader_source(true, false);
+        let underwater = gs_shader_source(true, true);
+        assert!(!dry.contains("underwater_transmission"));
+        assert!(!wet.contains("underwater_transmission"));
+        assert!(underwater.contains("underwater_transmission"));
+        assert!(underwater.contains("load_water_hit("));
     }
 }

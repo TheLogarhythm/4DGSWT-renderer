@@ -3,6 +3,9 @@ struct VertexOutput {
     @location(0) tex_coords: vec2<f32>,
     @location(1) mapped_height: f32,
     @location(2) vertex_alpha: f32,
+    // UNDERWATER_BEGIN:varying
+    @location(3) world_position: vec3<f32>,
+    // UNDERWATER_END:varying
 }
 
 struct Uniforms {
@@ -90,6 +93,9 @@ fn vs_main(
 
     out.clip_position = opengl_to_wgpu * uniforms.projection * uniforms.view * vec4(real_position, height, 1.0);
     out.tex_coords = real_position / uniforms.tile_width / 4.0;
+    // UNDERWATER_BEGIN:vertex
+    out.world_position = vec3<f32>(real_position, height);
+    // UNDERWATER_END:vertex
 
     return out;
 }
@@ -107,5 +113,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         frag_color = vec4(color * uniforms.brightness, 1.0);
     }
 
+    // UNDERWATER_BEGIN:fragment
+    let view_depth = -(uniforms.view * vec4(in.world_position, 1.0)).z;
+    let footprint = max(length(dpdx(in.world_position)), length(dpdy(in.world_position)));
+    let receiver_color = underwater_caustics(frag_color.rgb, in.world_position, footprint);
+    frag_color = vec4<f32>(underwater_compose(receiver_color, in.clip_position.xy, view_depth), frag_color.a);
+    // UNDERWATER_END:fragment
     return frag_color;
 }

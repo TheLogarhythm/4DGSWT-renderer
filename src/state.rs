@@ -28,7 +28,7 @@ use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
 use crate::wangtile::WangTile;
-use crate::water::WaterRenderer;
+use crate::water::{self, WaterRenderer};
 #[cfg(test)]
 use crate::worker::should_worker_sort;
 use crate::worker::{WorkerCommand, WorkerHandle, launch_worker_thread};
@@ -945,43 +945,24 @@ impl State {
                         .render_config
                         .water
                         .is_active(self.gui.config_user_data.surface_type);
-                    if rd.use_skybox {
-                        self.skybox
-                            .render(&self.queue, &mut encoder, &view, &self.camera);
+                    let underwater = if water_active {
+                        let position = self.camera.position();
+                        rd.render_config.water.underwater_frame(
+                            [position.x, position.y, position.z],
+                            water::bounds(&self.gui.config_user_data, rd),
+                        )
                     } else {
-                        // No sky was drawn: initialize uncovered pixels as well as the water area.
-                        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("Scene background clear"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                    }
-
-                    if rd.use_proxy {
-                        self.proxy
-                            .render(&self.queue, &mut encoder, &view, &self.camera, rd);
-                    }
-
+                        None
+                    };
                     let water_drawn = if water_active {
                         self.water
                             .get_or_insert_with(|| {
                                 WaterRenderer::new(&self.device, self.config.format)
                             })
-                            .render(
+                            .prepare(
                                 &self.device,
                                 &self.queue,
                                 &mut encoder,
-                                &view,
                                 &self.camera,
                                 &self.gui.config_user_data,
                                 rd,
@@ -992,8 +973,76 @@ impl State {
                                 self.profiler.water_timestamp_writes(),
                             )
                     } else {
+                        if let Some(water) = self.water.as_mut() {
+                            water.release_underwater();
+                        }
                         false
                     };
+                    if rd.use_skybox {
+                        self.skybox
+                            .render(&self.queue, &mut encoder, &view, &self.camera);
+                    } else {
+                        // No sky was drawn: initialize uncovered pixels as well as the water area.
+                        let background = underwater
+                            .map_or([0.0; 3], |frame| frame.color.map(|c| c * frame.strength));
+                        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Scene background clear"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: background[0] as f64,
+                                        g: background[1] as f64,
+                                        b: background[2] as f64,
+                                        a: 1.0,
+                                    }),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                    }
+
+                    if water_drawn && underwater.is_some() {
+                        self.water.as_ref().unwrap().render_background(
+                            &mut encoder,
+                            &view,
+                            self.skybox
+                                .water_environment
+                                .as_ref()
+                                .filter(|_| rd.use_skybox),
+                        );
+                    }
+                    if rd.use_proxy {
+                        self.proxy.render_with_water(
+                            &self.queue,
+                            &mut encoder,
+                            &view,
+                            &self.camera,
+                            rd,
+                            self.water
+                                .as_ref()
+                                .and_then(|w| w.hits())
+                                .filter(|_| water_drawn)
+                                .map(|h| &h.read),
+                        );
+                    }
+                    if water_drawn {
+                        self.water.as_ref().unwrap().render_surface(
+                            &mut encoder,
+                            &view,
+                            rd,
+                            self.skybox
+                                .water_environment
+                                .as_ref()
+                                .filter(|_| rd.use_skybox),
+                            self.profiler.water_timestamp_writes(),
+                        );
+                    }
 
                     if water_active && !water_drawn {
                         self.profiler.cancel_water_timestamp();

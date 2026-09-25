@@ -7,5 +7,6 @@ struct Uniforms {
     phases: vec4<f32>,
     material: vec4<f32>, // reflection strength, roughness, ripple strength, world scale
     detail_offsets: vec4<f32>,
+    underwater_color: vec4<f32>, // far-water color, camera submersion strength
 }
 @group(0) @binding(0) var<uniform> water: Uniforms;

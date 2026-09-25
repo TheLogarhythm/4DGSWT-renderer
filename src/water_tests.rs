@@ -1,11 +1,13 @@
 //! Pixel regression tests using the real GS pipeline and depth attachment.
+mod cache;
 mod fixtures;
 mod harness;
 mod intersections;
 mod material;
-mod visual;
 mod performance;
-mod cache;
+mod underwater;
+mod underwater_visual;
+mod visual;
 use crate::{structure::SurfaceType, test_support::gpu::RgbaFrame, utils::*};
 use harness::Harness;
 const WATER: [u8; 3] = [10, 61, 97];

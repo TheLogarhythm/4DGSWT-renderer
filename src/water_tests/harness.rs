@@ -142,30 +142,29 @@ impl Harness {
         queries: Option<&wgpu::QuerySet>,
     ) -> bool {
         let view = self.target.create_view(&Default::default());
+        let underwater = if self
+            .data
+            .render_config
+            .water
+            .is_active(self.user.surface_type)
         {
-            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("water test background"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: queries.map(|query_set| wgpu::RenderPassTimestampWrites {
+            let position = self.camera.position();
+            self.data.render_config.water.underwater_frame(
+                [position.x, position.y, position.z],
+                crate::water::bounds(&self.user, &self.data),
+            )
+        } else {
+            None
+        };
+        if let Some(query_set) = queries {
+            let _start = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Water test frame start"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                     query_set,
                     beginning_of_pass_write_index: Some(0),
                     end_of_pass_write_index: None,
                 }),
-                occlusion_query_set: None,
             });
-        }
-        if self.data.use_skybox {
-            self.skybox
-                .render(&self.queue, encoder, &view, &self.camera);
         }
         if let Some(time) = self.motion_time {
             self.gs
@@ -180,14 +179,10 @@ impl Harness {
                 )
                 .unwrap();
         }
-        if let Some(proxy) = self.proxy.as_mut() {
-            proxy.render(&self.queue, encoder, &view, &self.camera, &self.data);
-        }
-        let water_drawn = self.water.render(
+        let water_drawn = self.water.prepare(
             &self.device,
             &self.queue,
             encoder,
-            &view,
             &self.camera,
             &self.user,
             &self.data,
@@ -208,6 +203,76 @@ impl Harness {
                 }),
             },
         );
+        {
+            if self.data.use_skybox {
+                self.skybox
+                    .render(&self.queue, encoder, &view, &self.camera);
+            } else {
+                let background =
+                    underwater.map_or([0.0; 3], |frame| frame.color.map(|c| c * frame.strength));
+                {
+                    let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("water test background"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: background[0] as f64,
+                                    g: background[1] as f64,
+                                    b: background[2] as f64,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                }
+            }
+        }
+        if water_drawn && underwater.is_some() {
+            self.water.render_background(
+                encoder,
+                &view,
+                self.skybox
+                    .water_environment
+                    .as_ref()
+                    .filter(|_| self.data.use_skybox),
+            );
+        }
+        if let Some(proxy) = self.proxy.as_mut() {
+            proxy.render_with_water(
+                &self.queue,
+                encoder,
+                &view,
+                &self.camera,
+                &self.data,
+                self.water.hits().filter(|_| water_drawn).map(|h| &h.read),
+            );
+        }
+        if water_drawn {
+            self.water.render_surface(
+                encoder,
+                &view,
+                &self.data,
+                self.skybox
+                    .water_environment
+                    .as_ref()
+                    .filter(|_| self.data.use_skybox),
+                crate::profiler::WaterPassTimestamps {
+                    intersection: None,
+                    shading: queries.map(|query_set| wgpu::RenderPassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(3),
+                        end_of_pass_write_index: Some(4),
+                    }),
+                },
+            );
+        }
         self.gs.render(
             &self.queue,
             encoder,

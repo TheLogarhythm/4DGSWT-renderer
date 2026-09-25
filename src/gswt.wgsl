@@ -570,6 +570,15 @@ fn vs_main(
     let major = (position.x*majorAxis) / u_camera.viewport;
     let minor = (position.y*minorAxis) / u_camera.viewport;
     out.clip_position = vec4(vCenter.xy + u_scene.splat_scale*(major + minor), vCenter.z, 1.0);
+    // UNDERWATER_BEGIN:vertex
+    // Interpolate the smooth volume across each splat quad instead of sampling
+    // it for every overdrawn fragment. Each layer still uses its own view depth.
+    let underwater_depth = -(u_camera.view * vec4(center, 1.0)).z;
+    let underwater_pixel = (out.clip_position.xy * vec2(0.5, -0.5) + vec2(0.5)) * u_camera.viewport;
+    let receiver_footprint = sqrt(max(max(Vrk[0][0], Vrk[1][1]), Vrk[2][2])) * u_scene.splat_scale;
+    let receiver_color = underwater_caustics(vColor.rgb, center, receiver_footprint);
+    out.v_color = vec4(underwater_compose(receiver_color, underwater_pixel, underwater_depth), vColor.a);
+    // UNDERWATER_END:vertex
 
     return out;
 }
