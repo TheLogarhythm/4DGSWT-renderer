@@ -52,6 +52,8 @@ containment does not replace source qualification or constructor validation.
   `renderer/draw.rs` owns streamed index residency and compact tile-uniform batches;
   `renderer/pipelines.rs` builds shader variants and pipelines;
   `renderer/motion.rs` handles motion GPU preparation and authored dispatch.
+  `gui.rs` coordinates the configuration, scene/camera, water and performance panels
+  in `gui/`.
 - `worker.rs` coalesces camera requests and treats configuration as an ordering
   barrier. Only the worker waits; UI sends notify it and shutdown never joins on
   the browser main thread.
