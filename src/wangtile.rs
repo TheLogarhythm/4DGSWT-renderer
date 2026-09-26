@@ -520,7 +520,9 @@ impl WangTile {
             }
         }
 
-        if self.user_data.surface_type == SurfaceType::Sphere {
+        if self.user_data.surface_type != SurfaceType::HeightMap {
+            // Plane and sphere shaders still bind a height texture, but neither
+            // surface consumes the height-map settings hidden by the config UI.
             self.user_data.height_map_wh = vec2(1, 1);
             self.user_data.height_map = vec![0.0];
         } else {
@@ -749,7 +751,9 @@ impl WangTile {
                 if let Some(value) = cache_value.as_mut() {
                     // Cached streams were built with valid map IDs. Unchanged
                     // membership needs no per-Gaussian validation or rewrite.
-                    value.remap_instances(&[mi])?;
+                    if value.merge_from_vec != [mi] {
+                        value.remap_instances(&[mi])?;
+                    }
                 } else {
                     let selected_lod = nonmerged_render_lod(tile_instance)?;
                     let base = &self.tile_base_data[selected_lod][tile_instance.tid.1][view_id];
@@ -765,7 +769,9 @@ impl WangTile {
                 if self.user_data.use_cache {
                     if let Some(cache_value) = self.sort_lru_cache.get(&cache_key) {
                         let mut new_cache_value = cache_value.clone();
-                        new_cache_value.remap_instances(from_vec)?;
+                        if new_cache_value.merge_from_vec != *from_vec {
+                            new_cache_value.remap_instances(from_vec)?;
+                        }
                         let tagged = self.tag_render_value(
                             authored_registry,
                             &mut new_cache_value,
@@ -922,6 +928,12 @@ impl WangTile {
         let Some(canonical_xy) = self.canonical_xy.as_deref() else {
             return Ok(0);
         };
+        if !value.merge_from_vec.iter().any(|&map_index| {
+            let coord = self.index_to_map(map_index);
+            authored_registry.tile_has_authored([coord.x as u32, coord.y as u32])
+        }) {
+            return Ok(0);
+        }
         let tag_start = get_time_milliseconds();
         let tagged = tag_index_stream(
             authored_registry,
@@ -1803,15 +1815,8 @@ impl WangTile {
         map_coord: Vector2<usize>,
         tile_base: &TileBaseData,
     ) -> (Option<TileCornerData>, Option<TileEdgeData>) {
-        if self.user_data.tile_sort_type != TileSortType::Graph
-            && self.user_data.merge_type != SelectiveMergeType::Edge
-        {
-            return (None, None);
-        }
-
         let d_coords = [vec2(0, 0), vec2(0, 1), vec2(1, 1), vec2(1, 0)];
         let mut corner_data = TileCornerData::new();
-        let mut edge_data = TileEdgeData::new();
         for corner_i in 0..4_usize {
             if self.user_data.surface_type == SurfaceType::Sphere {
                 let corner_mc = map_coord + d_coords[corner_i];
@@ -1850,6 +1855,14 @@ impl WangTile {
                 corner_data[corner_i] = self.surface_mapping(map_coord, corner_pos, true).clone();
             }
         }
+        // The renderer culls every planar draw using these corners, regardless
+        // of how the worker sorts or merges tiles. Only edges are optional.
+        if self.user_data.tile_sort_type != TileSortType::Graph
+            && self.user_data.merge_type != SelectiveMergeType::Edge
+        {
+            return (Some(corner_data), None);
+        }
+        let mut edge_data = TileEdgeData::new();
         for edge_i in 0..4_usize {
             let (corner1_pos, corner1_to_world) = corner_data[edge_i];
             let (corner2_pos, corner2_to_world) = corner_data[(edge_i + 1) % 4];
@@ -2197,6 +2210,245 @@ mod tests {
         config.lod_max_dist = 100.0;
         wang.configure(config);
         wang
+    }
+
+    #[test]
+    fn worker_plane_config_from_initial_ui_defaults_builds_and_sorts() {
+        let mut wang = unconfigured_worker_fixture();
+        let mut config = UserData::new();
+        let mut text = UserDataString::new();
+        // Keep the initial UI defaults, with a small tile extent for the fixture.
+        text.tile_map_half_wh_s = vec2("1".into(), "1".into());
+        config.surface_type = SurfaceType::None;
+        let mut error = None;
+        text.to_raw(&mut config, &mut error);
+        assert_eq!(error, None);
+        assert_eq!(config.height_map_wh, vec2(0, 0));
+
+        let applied = wang.configure(config);
+
+        assert_eq!(applied.tile_map_wh, vec2(3, 3));
+        assert_eq!(applied.height_map_wh, vec2(1, 1));
+        assert_eq!(applied.height_map, [0.0]);
+        let camera = vec3(0.0, -8.0, 10.0);
+        assert_eq!(wang.build_tiles(camera).splat_count, 27);
+        let sorted = wang
+            .sort_tiles(
+                camera,
+                Mat4::identity(),
+                &mut AuthoredOccurrenceRegistry::default(),
+            )
+            .unwrap();
+        assert!(!sorted.tile_instance_vec.is_empty());
+    }
+
+    #[test]
+    fn worker_plane_config_switch_restores_height_map_from_ui() {
+        let mut wang = unconfigured_worker_fixture();
+        let mut config = UserData::new();
+        let mut text = UserDataString::new();
+        text.tile_map_half_wh_s = vec2("1".into(), "1".into());
+        text.height_map_wh_s = vec2("2".into(), "2".into());
+        config.height_map_type = HeightMapType::SlopeX;
+        let camera = vec3(0.0, -8.0, 10.0);
+        for surface in [
+            SurfaceType::HeightMap,
+            SurfaceType::None,
+            SurfaceType::HeightMap,
+        ] {
+            config.surface_type = surface;
+            let mut error = None;
+            text.to_raw(&mut config, &mut error);
+            assert_eq!(error, None);
+            config = wang.configure(config);
+            assert_eq!(config.tile_map_wh, vec2(3, 3));
+            if surface == SurfaceType::HeightMap {
+                assert_eq!(config.height_map_wh, vec2(2, 2));
+                assert_eq!(config.height_map, [-4.0, 0.0, -4.0, 0.0]);
+            } else {
+                assert_eq!(config.height_map_wh, vec2(1, 1));
+                assert_eq!(config.height_map, [0.0]);
+            }
+            assert_eq!(wang.build_tiles(camera).splat_count, 27);
+            let sorted = wang
+                .sort_tiles(
+                    camera,
+                    Mat4::identity(),
+                    &mut AuthoredOccurrenceRegistry::default(),
+                )
+                .unwrap();
+            assert!(!sorted.tile_instance_vec.is_empty());
+        }
+    }
+
+    #[test]
+    fn worker_culling_corners_exist_for_every_planar_sort_and_merge_mode() {
+        for surface in [SurfaceType::None, SurfaceType::HeightMap] {
+            let mut wang = worker_fixture(surface);
+            for sort in [
+                TileSortType::Distance,
+                TileSortType::Viewport,
+                TileSortType::Object,
+            ] {
+                for merge in [
+                    SelectiveMergeType::None,
+                    SelectiveMergeType::Axis,
+                    SelectiveMergeType::Edge,
+                ] {
+                    let mut config = wang.user_data.clone();
+                    config.tile_sort_type = sort.clone();
+                    config.merge_type = merge;
+                    wang.configure(config);
+                    let camera = vec3(0.0, -8.0, 10.0);
+                    wang.build_tiles(camera);
+                    let sorted = wang
+                        .sort_tiles(
+                            camera,
+                            Mat4::identity(),
+                            &mut AuthoredOccurrenceRegistry::default(),
+                        )
+                        .unwrap();
+                    assert!(!sorted.tile_instance_vec.is_empty());
+                    for tile in &sorted.tile_instance_vec {
+                        let corners = tile
+                            .corner_data
+                            .as_ref()
+                            .expect("renderer culling requires corners independently of sorting");
+                        for index in 0..4 {
+                            let point = corners[index].0;
+                            assert!(
+                                point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_merged_and_reverse_streams_skip_tag_work_without_membership() {
+        for surface in [SurfaceType::None, SurfaceType::Sphere] {
+            let mut wang = worker_fixture(surface);
+            let camera = vec3(0.0, -60.0, 20.0);
+            wang.build_tiles(camera);
+            // Enable the dynamic tagging path without needing an asset file.
+            wang.canonical_xy = Some(Arc::from(vec![[0.25, 0.25]; 48]));
+            if surface == SurfaceType::None {
+                let first = wang.map_to_index(vec2(0, 0));
+                let second = wang.map_to_index(vec2(1, 0));
+                wang.tile_map[[0, 0]].as_mut().unwrap().merge_status =
+                    TileMergeStatus::MergedFrom(vec![first, second]);
+                wang.tile_map[[1, 0]].as_mut().unwrap().merge_status =
+                    TileMergeStatus::MergedTo(first);
+            }
+            let mut registry = AuthoredOccurrenceRegistry::default();
+            for _ in 0..2 {
+                // Exercise both newly built streams and their LRU cache hits.
+                let sorted = wang
+                    .sort_tiles(camera, Mat4::identity(), &mut registry)
+                    .unwrap();
+                assert!(
+                    sorted
+                        .render_data_vec
+                        .iter()
+                        .any(|(_, value)| value.is_some())
+                );
+                assert_eq!(sorted.authored.tagged_occurrences, 0);
+                assert!(
+                    sorted
+                        .authored
+                        .authored_draws
+                        .iter()
+                        .all(|authored| !authored)
+                );
+                assert_eq!(
+                    sorted.authored.tag_time_ms, 0.0,
+                    "inactive draws must not enter or time the per-Gaussian tag pass"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_authored_membership_tags_each_dynamic_draw_and_cache_hit() {
+        for surface in [SurfaceType::None, SurfaceType::Sphere] {
+            let mut wang = worker_fixture(surface);
+            let camera = vec3(0.0, -60.0, 20.0);
+            wang.build_tiles(camera);
+            wang.canonical_xy = Some(Arc::from(vec![[0.25, 0.25]; 48]));
+            let authored_coord = if surface == SurfaceType::None {
+                let first = wang.map_to_index(vec2(0, 0));
+                let second = wang.map_to_index(vec2(1, 0));
+                wang.tile_map[[0, 0]].as_mut().unwrap().merge_status =
+                    TileMergeStatus::MergedFrom(vec![first, second]);
+                wang.tile_map[[1, 0]].as_mut().unwrap().merge_status =
+                    TileMergeStatus::MergedTo(first);
+                // Only the non-leading merged member has authored motion.
+                vec2(1, 0)
+            } else {
+                wang.tile_map
+                    .iter()
+                    .flatten()
+                    .find(|tile| (tile.to_local * (tile.tile_center - camera)).z > 0.0)
+                    .unwrap()
+                    .map_coord
+            };
+            let width = wang.user_data.tile_map_wh.x;
+            let height = wang.user_data.tile_map_wh.y;
+            let mut active_tiles = vec![0_u8; width * height];
+            active_tiles[authored_coord.y * width + authored_coord.x] = 1;
+            let snapshot = MotionMembershipSnapshot::new(
+                1,
+                1,
+                [1, 1],
+                [width as u32, height as u32],
+                [-256.0, -256.0],
+                [512.0, 512.0],
+                [0, 0],
+                Arc::from([1_u8]),
+                Arc::from(active_tiles),
+            );
+            let mut registry = AuthoredOccurrenceRegistry::default();
+            registry
+                .reset(
+                    1,
+                    AuthoredTagRequest {
+                        request_revision: 1,
+                        snapshot: Some(Arc::new(snapshot)),
+                    },
+                )
+                .unwrap();
+            for _ in 0..2 {
+                let sorted = wang
+                    .sort_tiles(camera, Mat4::identity(), &mut registry)
+                    .unwrap();
+                assert_eq!(sorted.authored.tagged_occurrences, 3);
+                assert_eq!(
+                    sorted
+                        .authored
+                        .authored_draws
+                        .iter()
+                        .filter(|&&active| active)
+                        .count(),
+                    1
+                );
+                for ((_, value), &authored) in sorted
+                    .render_data_vec
+                    .iter()
+                    .zip(&sorted.authored.authored_draws)
+                {
+                    let count = value.as_ref().map_or(0, |value| {
+                        value
+                            .gs_index
+                            .iter()
+                            .filter(|&&row| row & AUTHORED_TAG_BIT != 0)
+                            .count()
+                    });
+                    assert_eq!(count, if authored { 3 } else { 0 });
+                }
+            }
+        }
     }
 
     #[test]

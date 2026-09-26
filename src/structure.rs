@@ -1,4 +1,7 @@
-use std::sync::{Arc, mpsc::Receiver};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, mpsc::Receiver},
+};
 use winit::keyboard::KeyCode;
 
 use crate::control::{CameraControl, FlyPathControl};
@@ -171,7 +174,7 @@ impl UserDataString {
         );
         user_data.update_distance2 = user_data.update_distance2.powi(2);
         parse_num(&self.tile_width_s, &mut user_data.tile_width, err_msg);
-        if user_data.surface_type != SurfaceType::Sphere {
+        if user_data.surface_type == SurfaceType::HeightMap {
             parse_num(
                 &self.height_map_wh_s.x,
                 &mut user_data.height_map_wh.x,
@@ -1160,17 +1163,101 @@ impl RenderDataValue {
         if self.merge_from_vec.len() != current.len() {
             return Err("cached merge membership length mismatch".into());
         }
-        for map_id in &mut self.gs_map_id {
-            let index = self
-                .merge_from_vec
-                .iter()
-                .position(|&id| id as u32 == *map_id)
-                .ok_or("cached Gaussian references an unknown tile instance")?;
-            *map_id = u32::try_from(current[index]).map_err(|_| "tile instance ID exceeds u32")?;
+        let identity = self.merge_from_vec == current;
+        let mut remap = HashMap::with_capacity(current.len());
+        let mut current_ids = HashSet::new();
+        for (&previous, &next) in self.merge_from_vec.iter().zip(current) {
+            let previous = u32::try_from(previous).map_err(|_| "tile instance ID exceeds u32")?;
+            let next = u32::try_from(next).map_err(|_| "tile instance ID exceeds u32")?;
+            if remap.insert(previous, next).is_some() || (!identity && !current_ids.insert(next)) {
+                return Err("cached merge membership contains duplicate tile instances".into());
+            }
         }
-        self.merge_from_vec.clear();
-        self.merge_from_vec.extend_from_slice(current);
+        // Validate before mutating either stream. Publicly constructed values may
+        // be invalid even on identity; trusted cache hits skip this method when
+        // their compact membership is unchanged.
+        if self
+            .gs_map_id
+            .iter()
+            .any(|map_id| !remap.contains_key(map_id))
+        {
+            return Err("cached Gaussian references an unknown tile instance".into());
+        }
+        if identity {
+            return Ok(());
+        }
+        for map_id in &mut self.gs_map_id {
+            *map_id = remap[map_id];
+        }
+        self.merge_from_vec.copy_from_slice(current);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod render_membership_tests {
+    use super::RenderDataValue;
+
+    fn value(members: &[usize], rows: &[u32]) -> RenderDataValue {
+        RenderDataValue {
+            splat_count: rows.len(),
+            gs_index: (0..rows.len() as u32).collect(),
+            gs_map_id: rows.to_vec(),
+            merge_from_vec: members.to_vec(),
+            single_lod_id: 0,
+            gs_lod_id: None,
+        }
+    }
+
+    #[test]
+    fn remap_instances_preserves_identity_and_maps_sparse_members_in_order() {
+        let mut cached = value(&[71, 4, 900], &[900, 71, 4, 900]);
+        let rows_pointer = cached.gs_map_id.as_ptr();
+        cached.remap_instances(&[71, 4, 900]).unwrap();
+        assert_eq!(cached.gs_map_id, [900, 71, 4, 900]);
+        assert_eq!(cached.gs_map_id.as_ptr(), rows_pointer);
+        cached.remap_instances(&[5, 1000, 8]).unwrap();
+        assert_eq!(cached.gs_map_id, [8, 5, 1000, 8]);
+        assert_eq!(cached.merge_from_vec, [5, 1000, 8]);
+        assert_eq!(cached.gs_index, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn remap_instances_rejects_unknown_rows_without_partial_mutation() {
+        let mut cached = value(&[1, 2], &[1, 99]);
+        assert!(cached.remap_instances(&[3, 4]).is_err());
+        assert_eq!(cached.gs_map_id, [1, 99]);
+        assert_eq!(cached.merge_from_vec, [1, 2]);
+        assert!(cached.remap_instances(&[1, 2]).is_err());
+        assert!(cached.remap_instances(&[1]).is_err());
+    }
+
+    #[test]
+    fn remap_instances_rejects_ambiguous_membership_even_without_rows() {
+        assert!(value(&[1, 1], &[]).remap_instances(&[2, 3]).is_err());
+        assert!(value(&[1, 2], &[]).remap_instances(&[3, 3]).is_err());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn remap_instances_rejects_unrepresentable_membership_even_on_identity() {
+        let overflow = u32::MAX as usize + 1;
+        assert!(
+            value(&[overflow], &[0])
+                .remap_instances(&[overflow])
+                .is_err()
+        );
+        assert!(value(&[1], &[]).remap_instances(&[overflow]).is_err());
+    }
+
+    #[test]
+    fn remap_instances_handles_large_merges() {
+        let members: Vec<_> = (0..16_384).collect();
+        let current: Vec<_> = (20_000..36_384).rev().collect();
+        let rows: Vec<_> = (0..16_384).rev().collect();
+        let mut cached = value(&members, &rows);
+        cached.remap_instances(&current).unwrap();
+        assert!(cached.gs_map_id.iter().copied().eq(20_000..36_384));
     }
 }
 

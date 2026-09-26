@@ -60,6 +60,16 @@ containment does not replace source qualification or constructor validation.
   `motion_math.wgsl` once at pipeline creation while keeping global/local
   evaluation policies separate.
 
+### Worker preparation
+
+All planar sort modes produce culling corners. Graph edges are built only for
+Graph sorting or Edge merging. Cached instance membership takes an identity fast
+path; changed membership is remapped in O(splats + members). Dynamic draws with no
+authored membership skip the per-splat tag pass, and active draws reuse its count.
+Plane and Sphere bind a neutral 1×1 height texture; only HeightMap generates or
+resamples terrain. This also keeps initial Plane configuration valid before any
+height-map settings have been parsed.
+
 Authoring stores an ordered stroke document with a moving XY cache:
 `RGBA8Unorm` continuous fields plus `R8Uint` controller assignment. A 97×97-tile
 Default cache is 1552×1552 (about 11.5 MiB). Recenter reuses overlap and replays
