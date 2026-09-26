@@ -1054,6 +1054,7 @@ impl State {
                         let render_cpu_start = get_time_milliseconds();
                         let timestamp_writes = self.profiler.render_timestamp_writes();
                         let work = renderer.render_prepared(
+                            &self.device,
                             &self.queue,
                             &mut encoder,
                             &view,

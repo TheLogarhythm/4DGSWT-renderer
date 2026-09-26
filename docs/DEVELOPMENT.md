@@ -1,6 +1,6 @@
 # Developer reference
 
-[Back to README](../README.md) · [Usage](USAGE.md)
+[Back to README](../README.md) · [Usage](USAGE.md) · [Comparison viewer](COMPARISON_VIEWER.md)
 
 ## Build
 
@@ -48,7 +48,10 @@ containment does not replace source qualification or constructor validation.
 
 - `state.rs` coordinates loading/configuration and frame submission.
   `wangtile.rs` handles placement, LoD transitions, selective merging and sorting;
-  `renderer.rs` owns Gaussian GPU resources and draw pipelines.
+  `renderer.rs` coordinates Gaussian draw preparation and pass encoding.
+  `renderer/draw.rs` owns streamed index residency and compact tile-uniform batches;
+  `renderer/pipelines.rs` builds shader variants and pipelines;
+  `renderer/motion.rs` handles motion GPU preparation and authored dispatch.
 - `worker.rs` coalesces camera requests and treats configuration as an ordering
   barrier. Only the worker waits; UI sends notify it and shutdown never joins on
   the browser main thread.
@@ -60,7 +63,19 @@ containment does not replace source qualification or constructor validation.
   `motion_math.wgsl` once at pipeline creation while keeping global/local
   evaluation policies separate.
 
-### Worker preparation
+### Draw and water preparation
+
+Accepted worker sorts increment `RenderData.sort_revision`. Replacing a sort in
+an offscreen harness must also advance that revision. Streamed GS indices, map
+IDs and per-splat LoD IDs remain resident until the sort/authored revision,
+visible draw layout, configuration or buffer capacity changes. Streamed source
+and merged composition are separate properties: a single rear-facing sphere
+tile can use a streamed source while retaining its own LoD transition direction.
+
+Visible tile uniforms use compact 256-byte slots and one batched write when their
+contents change. Buffer capacity grows on demand; a high culled sort index does
+not reserve an unused uniform slot. The profiler's uploaded-byte count reports
+actual uploads, including uniform padding. It is a work measure, not an FPS claim.
 
 All planar sort modes produce culling corners. Graph edges are built only for
 Graph sorting or Edge merging. Cached instance membership takes an identity fast
@@ -70,13 +85,16 @@ Plane and Sphere bind a neutral 1×1 height texture; only HeightMap generates or
 resamples terrain. This also keeps initial Plane configuration valid before any
 height-map settings have been parsed.
 
-### Shared water preparation
-
 `state.rs` shares one `WaterFrame` across water, proxy and Gaussian preparation.
 Depth load/clear follows the preceding passes' actual result, including the
 sphere proxy skip. Flat-water intersection keys omit ineffective wave parameters
 and phases. Scattering retains phase dependence when light shafts are active;
 ripple shading and receiver caustics continue receiving live animation uniforms.
+
+The GPU draw-residency test checks upload counts, invalidation, empty visibility
+and growth beyond 20,000 visible uniforms. Cubed-sphere acceptance checks identical
+pixels after reusing uploads, both draw paths and both LoD transition directions.
+Water cache tests check both dispatch counts and animated output.
 
 Authoring stores an ordered stroke document with a moving XY cache:
 `RGBA8Unorm` continuous fields plus `R8Uint` controller assignment. A 97×97-tile
@@ -141,7 +159,6 @@ and short waves can increase cost or reach it.
 Profiler readback uses a four-buffer asynchronous ring; a busy ring drops samples
 instead of blocking rendering. CPU preparation/submission and GPU timings have
 different scopes; see [water benchmark evidence](water-performance.md).
-
 Water preparation now reuses unchanged intersection/scattering textures. Fixed-camera,
 fixed-phase benchmarks measure this cached case; advance the water clock or move the
 camera when measuring animated preparation cost. Caustic offsets alone do not
@@ -221,7 +238,10 @@ cargo test --offline --target x86_64-pc-windows-msvc --lib cubed_sphere -- --tes
 These tests cover closed Wang adjacency/source direction, odd N, analytic
 derivatives, CPU/GPU agreement, configuration errors and switching, reverse LoD
 streams, and offscreen rendering through both draw paths on all six faces.
-This is synthetic acceptance; it does not establish actual sun-asset seam quality or frame rate.
+The offscreen test also checks compact slots for high sort indices and both
+transition directions with three LoDs. A separate draw-resource GPU test grows
+beyond the former 20,000-tile uniform capacity. This is synthetic
+acceptance; it does not establish actual sun-asset seam quality or frame rate.
 
 ### Open checks and known issues
 

@@ -280,6 +280,7 @@ impl Harness {
             );
         }
         self.gs.render(
+            &self.device,
             &self.queue,
             encoder,
             &view,

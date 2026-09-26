@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[test]
-fn cubed_sphere_renders_all_faces_in_both_draw_paths() {
+fn cubed_sphere_renders_all_faces_in_both_draw_paths_and_reuses_uploads() {
     let GpuTestContext { device, queue, .. } = GpuTestContext::new(
         "sphere render acceptance",
         MissingGpu::Fail,
@@ -137,6 +137,14 @@ fn cubed_sphere_renders_all_faces_in_both_draw_paths() {
                 });
                 let mut instances = vec![];
                 let mut draws = vec![];
+                // A high sort index needs only one compact visible uniform slot.
+                // These dummy rows are LoD-disabled.
+                if n == 1 && face == 0 && !streamed {
+                    let mut disabled = tile.clone();
+                    disabled.tid.0 = 1;
+                    instances = vec![disabled; 6 * 128 * 128 - 1];
+                    draws = vec![(RenderDataKey::new(), None); instances.len()];
+                }
                 instances.push(drawn_tile);
                 draws.push((key, value));
                 data.cur_sort_data = Some(SortData {
@@ -167,7 +175,8 @@ fn cubed_sphere_renders_all_faces_in_both_draw_paths() {
                         occlusion_query_set: None,
                     });
                 }
-                gs.render(
+                let first_work = gs.render(
+                    &device,
                     &queue,
                     &mut encoder,
                     &view,
@@ -179,6 +188,47 @@ fn cubed_sphere_renders_all_faces_in_both_draw_paths() {
                 );
                 queue.submit(Some(encoder.finish()));
                 let frame = read_texture_bytes(&device, &queue, &target, [64, 64]);
+                if streamed {
+                    let mut repeat = device.create_command_encoder(&Default::default());
+                    {
+                        let _clear = repeat.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: None,
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                    }
+                    let work = gs.render(
+                        &device,
+                        &queue,
+                        &mut repeat,
+                        &view,
+                        &camera,
+                        &data,
+                        false,
+                        None,
+                        None,
+                    );
+                    queue.submit(Some(repeat.finish()));
+                    assert!(
+                        work.uploaded_bytes < first_work.uploaded_bytes,
+                        "unchanged streamed draws must reuse GPU uploads"
+                    );
+                    let repeated_frame = read_texture_bytes(&device, &queue, &target, [64, 64]);
+                    assert!(
+                        frame == repeated_frame,
+                        "resident draws must preserve pixels"
+                    );
+                }
                 let center = &frame[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 3];
                 assert!(
                     center.iter().map(|&v| v as u32).sum::<u32>() > 150,

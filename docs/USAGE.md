@@ -230,6 +230,11 @@ upload bytes and authored-motion activity. GPU timings require adapter timestamp
 support; the panel reports unsupported/readback-error states. **Reset Timer** clears
 history, and profiling can be disabled.
 
+Unchanged sorted draws reuse GPU index data. Visible tile parameters are uploaded
+as one batch only when needed, so upload bytes may drop while animation continues.
+Flat water also reuses its intersection texture while ripples, shafts and caustics
+keep animating. Compare frame timings on the same scene and camera to assess FPS.
+
 Startup console timings measure loading and preparation separately; GPU preparation
 means CPU work/API submission, not completed GPU execution. Compare the same asset
 after a full reload. See [water measurements](water-performance.md) and
