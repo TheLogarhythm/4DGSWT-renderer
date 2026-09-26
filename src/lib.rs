@@ -8,6 +8,11 @@ mod app;
 mod camera;
 mod caustics;
 mod control;
+mod cubed_sphere;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cubed_sphere_gpu_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cubed_sphere_render_tests;
 mod dynamic_archive;
 mod gui;
 mod motion;
@@ -34,6 +39,8 @@ mod scene_archive;
 mod skybox;
 mod state;
 mod structure;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod test_support;
 mod texture;
 mod underwater;
 mod utils;
@@ -41,8 +48,6 @@ mod wangtile;
 mod water;
 mod water_environment;
 mod water_hits;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod test_support;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod water_tests;
 mod worker;

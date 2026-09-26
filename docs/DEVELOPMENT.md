@@ -187,6 +187,24 @@ Run benchmarks separately from other GPU tests. Outputs include images and
 `timings.json`; [measurement conditions and results](water-performance.md) are
 maintained separately.
 
+### Cubed-sphere verification
+
+`src/cubed_sphere.rs` owns the six oriented face frames, constant-time neighbor
+lookup and analytic position/Jacobian mapping. `src/cubed_sphere.wgsl` mirrors
+that mapping and is compiled into each GS pipeline. The internal atlas is 6N by
+N; do not derive sphere dimensions from the plane's half-width/half-height.
+CPU presort selection transforms a depth covector with the Jacobian transpose.
+Normals and positions retain their distinct transformation rules.
+
+```powershell
+cargo test --offline --target x86_64-pc-windows-msvc --lib cubed_sphere -- --test-threads=1
+```
+
+These tests cover closed Wang adjacency/source direction, odd N, analytic
+derivatives, CPU/GPU agreement, configuration errors and switching, reverse LoD
+streams, and offscreen rendering through both draw paths on all six faces.
+This is synthetic acceptance; it does not establish actual sun-asset seam quality or frame rate.
+
 ### Open checks and known issues
 
 - Maintenance browser acceptance still needs a recorded paint/pan/reconfigure,

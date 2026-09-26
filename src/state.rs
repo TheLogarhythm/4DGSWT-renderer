@@ -564,6 +564,9 @@ impl State {
 
                 if let Ok(wang_user_data) = channels.rx_user_data.try_recv() {
                     if wang_user_data.config_id == self.gui.config_user_data.config_id {
+                        if wang_user_data.surface_type == SurfaceType::Sphere {
+                            self.camera.frame_sphere(wang_user_data.sphere_radius);
+                        }
                         renderer.configure(
                             &self.device,
                             &self.queue,

@@ -143,6 +143,32 @@ fn nonmerged_render_lod(tile: &TileInstance) -> Result<usize, String> {
     }
 }
 
+// Reuse the existing streamed draw path for the sphere's opposite hemisphere.
+// Filter unused LoDs before reversal; preserve row/LoD alignment during blends.
+fn reversed_sphere_value(
+    base: &TileBaseData,
+    tile: &TileInstance,
+    map_index: usize,
+) -> RenderDataValue {
+    let changing = matches!(tile.transition_status, TileTransitionStatus::Changing(_));
+    let rows: Vec<_> = base
+        .gs_index
+        .iter()
+        .copied()
+        .zip(base.gs_lod_id.iter().copied())
+        .rev()
+        .filter(|&(_, lod)| changing || lod == tile.tid.0 as u32)
+        .collect();
+    RenderDataValue {
+        splat_count: rows.len(),
+        gs_index: rows.iter().map(|&(index, _)| index).collect(),
+        gs_map_id: vec![map_index as u32; rows.len()],
+        merge_from_vec: vec![map_index],
+        single_lod_id: if changing { -1 } else { tile.tid.0 as i32 },
+        gs_lod_id: changing.then(|| rows.iter().map(|&(_, lod)| lod).collect()),
+    }
+}
+
 pub struct WangTile {
     pub user_data: UserData,
     pub tile_splats_vec: Vec<Vec<Scene>>,
@@ -417,65 +443,19 @@ impl WangTile {
         let mut neighbor = MapNeighbor::new();
         match self.user_data.surface_type {
             SurfaceType::Sphere => {
-                let map_w = self.user_data.tile_map_wh.x;
-                let map_h = self.user_data.tile_map_wh.y;
-                let block_w = self.user_data.tile_map_wh.x / 5;
-                let block_id_x = 5 * map_coord.x / map_w;
-                let block_id_y = 2 * map_coord.y / map_h;
-                let block_x = map_coord.x - block_id_x * block_w;
-                let block_y = map_coord.y - block_id_y * block_w;
-                // West
-                if block_x > 0 {
-                    neighbor.west = Some((vec2(map_coord.x - 1, map_coord.y), 2));
-                } else {
-                    if block_id_y == 0 {
-                        neighbor.west = Some((
-                            vec2((map_w + map_coord.x - 1) % map_w, map_coord.y + block_w),
-                            2,
-                        ));
-                    } else {
-                        neighbor.west = Some((
-                            vec2((map_w + map_coord.x - block_y - 1) % map_w, map_h - 1),
-                            1,
-                        ));
-                    }
-                }
-                // East
-                if block_x < block_w - 1 {
-                    neighbor.east = Some((vec2(map_coord.x + 1, map_coord.y), 0));
-                } else {
-                    if block_id_y == 0 {
-                        neighbor.east =
-                            Some((vec2((map_coord.x + block_w - block_y) % map_w, 0), 3));
-                    } else {
-                        neighbor.east =
-                            Some((vec2((map_coord.x + 1) % map_w, map_coord.y - block_w), 0));
-                    }
-                }
-                // South
-                if map_coord.y > 0 {
-                    neighbor.south = Some((vec2(map_coord.x, map_coord.y - 1), 1));
-                } else {
-                    neighbor.south = Some((
-                        vec2(
-                            (map_w + block_id_x * block_w - 1) % map_w,
-                            block_w - 1 - block_x,
-                        ),
-                        2,
-                    ));
-                }
-                // North
-                if map_coord.y < map_h - 1 {
-                    neighbor.north = Some((vec2(map_coord.x, map_coord.y + 1), 3));
-                } else {
-                    neighbor.north = Some((
-                        vec2(
-                            (block_id_x * block_w + block_w) % map_w,
-                            2 * block_w - 1 - block_x,
-                        ),
-                        0,
-                    ));
-                }
+                let get = |side| {
+                    Some(crate::cubed_sphere::neighbor(
+                        map_coord,
+                        side,
+                        self.user_data.sphere_tiles_per_face,
+                    ))
+                };
+                neighbor = MapNeighbor {
+                    west: get(0),
+                    north: get(1),
+                    east: get(2),
+                    south: get(3),
+                };
             }
             _ => {
                 if map_coord.x > 0 {
@@ -514,8 +494,15 @@ impl WangTile {
         }
 
         if self.user_data.surface_type == SurfaceType::Sphere {
-            self.user_data.tile_map_wh = self.user_data.tile_map_half_wh * 2;
-            assert!(self.user_data.tile_map_wh.x * 2 == self.user_data.tile_map_wh.y * 5);
+            // The atlas is only storage; face frames define its actual spherical layout.
+            let n = self
+                .user_data
+                .sphere_tiles_per_face
+                .clamp(1, crate::cubed_sphere::MAX_FACE_TILES);
+            self.user_data.sphere_tiles_per_face = n;
+            self.user_data.tile_map_wh = vec2(6 * n, n);
+            // Planar depth merges cannot share one presort frame across curved tiles.
+            self.user_data.merge_type = SelectiveMergeType::None;
         } else {
             self.user_data.tile_map_wh = self.user_data.tile_map_half_wh * 2 + vec2(1, 1);
         }
@@ -533,44 +520,49 @@ impl WangTile {
             }
         }
 
-        // Height map
-        const MAP_RESO: usize = 1024; // Internal map resolution
-        let h_map_width = self.user_data.height_map_wh.x;
-        let h_map_height = self.user_data.height_map_wh.y;
-        let mut height_map = Vec::new();
-        for i in 0..h_map_height {
-            for j in 0..h_map_width {
-                let h: f32 = match self.user_data.height_map_type {
-                    HeightMapType::Texture => 0.0, // Placeholder, handled below
-                    HeightMapType::Random => self.rng.random_range(-1.0..=1.0),
-                    HeightMapType::SlopeX => j as f32 / h_map_height as f32 * 2.0 - 1.0,
-                    HeightMapType::SlopeY => i as f32 / h_map_height as f32 * 2.0 - 1.0,
-                    HeightMapType::DualSlope => {
-                        i as f32 / h_map_width as f32 + j as f32 / h_map_height as f32 - 1.0
-                    }
-                };
-                height_map.push(h);
+        if self.user_data.surface_type == SurfaceType::Sphere {
+            self.user_data.height_map_wh = vec2(1, 1);
+            self.user_data.height_map = vec![0.0];
+        } else {
+            // Height map
+            const MAP_RESO: usize = 1024; // Internal map resolution
+            let h_map_width = self.user_data.height_map_wh.x;
+            let h_map_height = self.user_data.height_map_wh.y;
+            let mut height_map = Vec::new();
+            for i in 0..h_map_height {
+                for j in 0..h_map_width {
+                    let h: f32 = match self.user_data.height_map_type {
+                        HeightMapType::Texture => 0.0, // Placeholder, handled below
+                        HeightMapType::Random => self.rng.random_range(-1.0..=1.0),
+                        HeightMapType::SlopeX => j as f32 / h_map_height as f32 * 2.0 - 1.0,
+                        HeightMapType::SlopeY => i as f32 / h_map_height as f32 * 2.0 - 1.0,
+                        HeightMapType::DualSlope => {
+                            i as f32 / h_map_width as f32 + j as f32 / h_map_height as f32 - 1.0
+                        }
+                    };
+                    height_map.push(h);
+                }
             }
+            if self.user_data.height_map_type == HeightMapType::Texture
+                && self.user_data.height_tex.is_some()
+            {
+                self.user_data.height_map_wh = self.user_data.height_tex.as_ref().unwrap().1;
+                height_map = self.user_data.height_tex.as_ref().unwrap().0.clone();
+            }
+            height_map
+                .iter_mut()
+                .for_each(|v| *v *= self.user_data.tile_width * self.user_data.height_map_scale.z);
+            // Map resize
+            if self.user_data.height_map_type == HeightMapType::Random {
+                height_map = self.map_resize(
+                    height_map.as_slice(),
+                    self.user_data.height_map_wh,
+                    vec2(MAP_RESO, MAP_RESO),
+                );
+                self.user_data.height_map_wh = vec2(MAP_RESO, MAP_RESO);
+            }
+            self.user_data.height_map = height_map;
         }
-        if self.user_data.height_map_type == HeightMapType::Texture
-            && self.user_data.height_tex.is_some()
-        {
-            self.user_data.height_map_wh = self.user_data.height_tex.as_ref().unwrap().1;
-            height_map = self.user_data.height_tex.as_ref().unwrap().0.clone();
-        }
-        height_map
-            .iter_mut()
-            .for_each(|v| *v *= self.user_data.tile_width * self.user_data.height_map_scale.z);
-        // Map resize
-        if self.user_data.height_map_type == HeightMapType::Random {
-            height_map = self.map_resize(
-                height_map.as_slice(),
-                self.user_data.height_map_wh,
-                vec2(MAP_RESO, MAP_RESO),
-            );
-            self.user_data.height_map_wh = vec2(MAP_RESO, MAP_RESO);
-        }
-        self.user_data.height_map = height_map;
 
         // Lod transition dist
         self.user_data.lod_transition_dist.clear();
@@ -671,7 +663,9 @@ impl WangTile {
 
             // Build cache key
             let view_id: usize;
-            let cache_key: RenderDataKey;
+            let mut cache_key: RenderDataKey;
+            let reverse_sphere = self.user_data.surface_type == SurfaceType::Sphere
+                && (tile_instance.to_local * (tile_instance.tile_center - camera_pos)).z > 0.0;
             if let TileMergeStatus::MergedFrom(from_vec) = &tile_instance.merge_status {
                 let merge_len = from_vec.len();
                 let mut merge_x = true;
@@ -716,7 +710,11 @@ impl WangTile {
                 };
             } else {
                 view_id = self.choose_presort_view(
-                    tile_instance.to_local,
+                    if reverse_sphere {
+                        -tile_instance.to_local
+                    } else {
+                        tile_instance.to_local
+                    },
                     tile_instance.tile_center,
                     camera_pos,
                 );
@@ -729,6 +727,11 @@ impl WangTile {
                 };
             }
 
+            if reverse_sphere {
+                // Disjoint cache namespace, while retaining the existing 25-view
+                // asset bank. Opposite-direction depth order is its exact reverse.
+                cache_key.view_id += self.presort_dirs.len();
+            }
             // Push metadata
             // let mut tile_instance_meta = TileInstance::from_metadata(tile_instance);
             // tile_instance_meta.view_id = view_id;
@@ -738,16 +741,36 @@ impl WangTile {
             tile_instance_vec.push(new_tile_instance);
 
             let mut cache_value: Option<RenderDataValue> = None;
+            let mut draw_tagged = 0;
+            if reverse_sphere {
+                if self.user_data.use_cache {
+                    cache_value = self.sort_lru_cache.get(&cache_key).cloned();
+                }
+                if let Some(value) = cache_value.as_mut() {
+                    // Cached streams were built with valid map IDs. Unchanged
+                    // membership needs no per-Gaussian validation or rewrite.
+                    value.remap_instances(&[mi])?;
+                } else {
+                    let selected_lod = nonmerged_render_lod(tile_instance)?;
+                    let base = &self.tile_base_data[selected_lod][tile_instance.tid.1][view_id];
+                    let value = reversed_sphere_value(base, tile_instance, mi);
+                    if self.user_data.use_cache {
+                        self.sort_lru_cache.put(cache_key.clone(), value.clone());
+                    }
+                    cache_value = Some(value);
+                }
+            }
             if let TileMergeStatus::MergedFrom(from_vec) = &tile_instance.merge_status {
                 // Use cache if exist
                 if self.user_data.use_cache {
                     if let Some(cache_value) = self.sort_lru_cache.get(&cache_key) {
                         let mut new_cache_value = cache_value.clone();
                         new_cache_value.remap_instances(from_vec)?;
-                        let tag_start = get_time_milliseconds();
-                        let tagged =
-                            self.tag_render_value(authored_registry, &mut new_cache_value)?;
-                        tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+                        let tagged = self.tag_render_value(
+                            authored_registry,
+                            &mut new_cache_value,
+                            &mut tag_time_ms,
+                        )?;
                         tagged_occurrences += tagged;
                         authored_draws.push(tagged != 0);
                         render_data_vec.push((cache_key, Some(new_cache_value)));
@@ -852,30 +875,27 @@ impl WangTile {
                     single_lod_id: -1,
                     gs_lod_id: Some(base_data.gs_lod_id.clone()),
                 };
-                let tag_start = get_time_milliseconds();
-                let tagged = self.tag_render_value(authored_registry, &mut authored_value)?;
-                tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+                let tagged = self.tag_render_value(
+                    authored_registry,
+                    &mut authored_value,
+                    &mut tag_time_ms,
+                )?;
                 if tagged != 0 {
                     tagged_occurrences += tagged;
+                    draw_tagged = tagged;
                     cache_value = Some(authored_value);
                 }
             }
 
             if let Some(value) = cache_value.as_mut()
-                && matches!(tile_instance.merge_status, TileMergeStatus::MergedFrom(_))
+                && (reverse_sphere
+                    || matches!(tile_instance.merge_status, TileMergeStatus::MergedFrom(_)))
             {
-                let tag_start = get_time_milliseconds();
-                let tagged = self.tag_render_value(authored_registry, value)?;
-                tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
-                tagged_occurrences += tagged;
+                draw_tagged = self.tag_render_value(authored_registry, value, &mut tag_time_ms)?;
+                tagged_occurrences += draw_tagged;
             }
 
-            authored_draws.push(cache_value.as_ref().is_some_and(|value| {
-                value
-                    .gs_index
-                    .iter()
-                    .any(|index| index & AUTHORED_TAG_BIT != 0)
-            }));
+            authored_draws.push(draw_tagged != 0);
             render_data_vec.push((cache_key, cache_value));
             // log!{"Process {}, {:?} finish", i, map_coord};
         }
@@ -897,11 +917,13 @@ impl WangTile {
         &self,
         authored_registry: &mut AuthoredOccurrenceRegistry,
         value: &mut RenderDataValue,
+        tag_time_ms: &mut f64,
     ) -> Result<usize, String> {
         let Some(canonical_xy) = self.canonical_xy.as_deref() else {
             return Ok(0);
         };
-        tag_index_stream(
+        let tag_start = get_time_milliseconds();
+        let tagged = tag_index_stream(
             authored_registry,
             canonical_xy,
             &mut value.gs_index,
@@ -920,7 +942,9 @@ impl WangTile {
                     [tile.tile_offset.x, tile.tile_offset.y, tile.tile_offset.z],
                 ))
             },
-        )
+        )?;
+        *tag_time_ms += (get_time_milliseconds() - tag_start).max(0.0);
+        Ok(tagged)
     }
 
     pub fn check_update(&self, camera_pos: &Vec3) -> bool {
@@ -934,10 +958,10 @@ impl WangTile {
 
     fn choose_presort_view(&self, transform: Mat3, pos: Vec3, cam_pos: Vec3) -> usize {
         let dir_global = (pos - cam_pos).normalize();
-        let dir_local = transform * dir_global;
+        let dir_local = (transform * dir_global).normalize();
 
         let mut best_view: usize = 0;
-        let mut best_err: f32 = 1000.0;
+        let mut best_err: f32 = f32::INFINITY;
         for (i, presort_dir) in self.presort_dirs.iter().enumerate() {
             let err = (dir_local.x - presort_dir.x).powi(2)
                 + (dir_local.y - presort_dir.y).powi(2)
@@ -1638,88 +1662,22 @@ impl WangTile {
                 }
             }
             SurfaceType::Sphere => {
-                let xmax = self.user_data.tile_map_wh.x as f32 * self.user_data.tile_width;
-                let ymax = self.user_data.tile_map_wh.y as f32 * self.user_data.tile_width;
-                let block_w = xmax / 5.0;
-
-                let get_uv =
-                    |block_id_x: f32, block_id_y: f32, block_x: f32, block_y: f32| -> Vec2 {
-                        let mut u: f32;
-                        let mut v: f32;
-                        if block_id_y == 0.0 {
-                            if block_y < block_x {
-                                if block_x - block_y == block_w {
-                                    u = 0.0;
-                                } else {
-                                    u = (block_y / (block_w - (block_x - block_y)) + block_id_x)
-                                        / 5.0;
-                                }
-                                v = (block_w - (block_x - block_y)) / block_w / 3.0;
-                            } else {
-                                u = (block_x / block_w + block_id_x) / 5.0
-                                    + (block_y - block_x) / block_w * 0.1;
-                                v = (block_y - block_x) / block_w / 3.0 + 1.0 / 3.0;
-                            }
-                        } else {
-                            if block_y < block_x {
-                                u = (block_x / block_w + block_id_x) / 5.0
-                                    + (block_w - (block_x - block_y)) / block_w * 0.1;
-                                v = (block_w - (block_x - block_y)) / block_w / 3.0 + 1.0 / 3.0;
-                            } else {
-                                if block_y - block_x == block_w {
-                                    u = 0.0;
-                                } else {
-                                    u = (block_x / (block_w - (block_y - block_x)) + block_id_x)
-                                        / 5.0
-                                        + 0.1;
-                                }
-                                v = (block_y - block_x) / block_w / 3.0 + 2.0 / 3.0;
-                            }
-                        }
-
-                        u += 0.5 * v.floor(); // In case v is out of [0, 1]
-                        u *= 2.0 * PI;
-                        v = (v - 0.5) * PI;
-
-                        vec2(u, v)
-                    };
-
-                let uv_to_pos = |uv: Vec2| -> Vec3 {
-                    vec3(
-                        f32::cos(uv.y) * f32::cos(uv.x),
-                        f32::cos(uv.y) * f32::sin(uv.x),
-                        f32::sin(uv.y),
-                    )
-                };
-
-                new_pos -= self.coord_to_pos(self.map_to_coord(vec2(0, 0)));
-                let block_id_x = (5 * map_coord.x / self.user_data.tile_map_wh.x as usize) as f32;
-                let block_id_y = (2 * map_coord.y / self.user_data.tile_map_wh.y as usize) as f32;
-                let block_x = new_pos.x - block_id_x * block_w;
-                let block_y = new_pos.y - block_id_y * block_w;
-
-                let uv = get_uv(block_id_x, block_id_y, block_x, block_y);
-                let local_z = uv_to_pos(uv);
-                let r = self.user_data.sphere_radius;
-                new_pos = local_z * r;
-
-                let dt: f32 = DELTA * ymax;
-                let pos_r = uv_to_pos(get_uv(block_id_x, block_id_y, block_x + dt, block_y)) * r;
-                let pos_l = uv_to_pos(get_uv(block_id_x, block_id_y, block_x - dt, block_y)) * r;
-                let pos_u = uv_to_pos(get_uv(block_id_x, block_id_y, block_x, block_y + dt)) * r;
-                let pos_d = uv_to_pos(get_uv(block_id_x, block_id_y, block_x, block_y - dt)) * r;
-
-                let local_x = (pos_r - pos_l) / (2.0 * dt);
-                let local_y = (pos_u - pos_d) / (2.0 * dt);
-
-                let local_to_world = Mat3::from_cols(local_x, local_y, local_z);
-                let local_offset = local_to_world * vec3(0.0, 0.0, pos.z);
-                new_pos += local_offset;
-                if to_world {
-                    transform = local_to_world;
+                let n = self.user_data.sphere_tiles_per_face;
+                let face = map_coord.x / n;
+                let origin = self.coord_to_pos(self.map_to_coord(vec2(face * n, 0)));
+                let (mapped, jacobian) = crate::cubed_sphere::map(
+                    face,
+                    pos - origin,
+                    n,
+                    self.user_data.tile_width,
+                    self.user_data.sphere_radius,
+                );
+                new_pos = mapped;
+                transform = if to_world {
+                    jacobian
                 } else {
-                    transform = local_to_world.invert().unwrap();
-                }
+                    jacobian.transpose()
+                };
             }
             SurfaceType::None => {}
         }
@@ -1855,6 +1813,13 @@ impl WangTile {
         let mut corner_data = TileCornerData::new();
         let mut edge_data = TileEdgeData::new();
         for corner_i in 0..4_usize {
+            if self.user_data.surface_type == SurfaceType::Sphere {
+                let corner_mc = map_coord + d_coords[corner_i];
+                let corner_pos = self.coord_to_pos(self.map_to_coord(corner_mc))
+                    + Vec3::unit_z() * tile_base.tile_center.z;
+                corner_data[corner_i] = self.surface_mapping(map_coord, corner_pos, true);
+                continue;
+            }
             let mut copy_from_neighbor = false;
             if let Some((n_mc, n_edge_idx)) =
                 self.neighbor_map[[map_coord.x, map_coord.y]][corner_i]
@@ -2205,6 +2170,140 @@ mod tests {
             output[29..32].fill(127);
         }
         scene
+    }
+
+    fn unconfigured_worker_fixture() -> WangTile {
+        let scenes = (0..16)
+            .map(|_| scene(&[[0.0, 0.0, 0.0], [4.0, 4.0, 0.0], [2.0, 2.0, 0.8]]))
+            .collect();
+        WangTile::new(LoadedArchive {
+            scenes: vec![scenes],
+            dynamic: None,
+        })
+        .unwrap()
+    }
+
+    fn worker_fixture(surface_type: SurfaceType) -> WangTile {
+        let mut wang = unconfigured_worker_fixture();
+        let mut config = UserData::new();
+        config.surface_type = surface_type;
+        config.tile_map_half_wh = vec2(1, 1);
+        config.sphere_tiles_per_face = 1;
+        config.tile_sort_type = TileSortType::Distance;
+        config.merge_type = SelectiveMergeType::None;
+        config.height_map_wh = vec2(2, 2);
+        config.height_map_type = HeightMapType::SlopeX;
+        config.height_map_scale.z = 0.25;
+        config.lod_max_dist = 100.0;
+        wang.configure(config);
+        wang
+    }
+
+    #[test]
+    fn cubed_sphere_worker_generates_matching_tiles_and_reconfigures_odd_n() {
+        let scenes = (0..16)
+            .map(|_| scene(&[[0., 0., 0.], [4., 4., 0.], [2., 2., 0.8]]))
+            .collect();
+        let mut wang = WangTile::new(LoadedArchive {
+            scenes: vec![scenes],
+            dynamic: None,
+        })
+        .unwrap();
+        let mut config = UserData::new();
+        config.surface_type = SurfaceType::Sphere;
+        config.tile_map_half_wh = vec2(7, 5); // independent plane settings must survive
+        config.lod_max_dist = 100.;
+        for n in [1, 3, 2] {
+            config.sphere_tiles_per_face = n;
+            let applied = wang.configure(config.clone());
+            assert_eq!(applied.tile_map_wh, vec2(6 * n, n));
+            assert_eq!(applied.tile_map_half_wh, vec2(7, 5));
+            assert!(applied.merge_type == SelectiveMergeType::None);
+            wang.build_tiles(vec3(0., -60., 20.));
+            let mut original = Vec::new();
+            for x in 0..6 * n {
+                for y in 0..n {
+                    let tile = wang.tile_map[[x, y]].as_ref().unwrap();
+                    original.push(tile.tid);
+                    let colors = wang.tile_id_to_color(tile.tid.1);
+                    for side in 0..4 {
+                        let (other, os) = wang.neighbor_map[[x, y]][side].unwrap();
+                        let neighbor = wang.tile_map[[other.x, other.y]].as_ref().unwrap();
+                        assert_eq!(colors[side], wang.tile_id_to_color(neighbor.tid.1)[os]);
+                    }
+                    let expected = crate::cubed_sphere::map(
+                        x / n,
+                        wang.tile_base_data[0][tile.tid.1][0].tile_center
+                            + vec3((x % n) as f32 * 4., y as f32 * 4., 0.),
+                        n,
+                        4.,
+                        20.,
+                    )
+                    .0;
+                    assert!((tile.tile_center - expected).magnitude() < 1e-5);
+                    let local = wang.tile_base_data[0][tile.tid.1][0].tile_center
+                        + vec3((x % n) as f32 * 4., y as f32 * 4., 0.);
+                    let (_, j) = crate::cubed_sphere::map(x / n, local, n, 4., 20.);
+                    let ray = vec3(0.4, 0.7, -0.6).normalize();
+                    assert!(
+                        (tile.to_local * ray - j.transpose() * ray).magnitude() < 1e-5,
+                        "sphere presort must transform depth covectors with J transpose"
+                    );
+                }
+            }
+            let sorted = wang
+                .sort_tiles(
+                    vec3(0., -60., 20.),
+                    Mat4::identity(),
+                    &mut AuthoredOccurrenceRegistry::default(),
+                )
+                .unwrap();
+            assert_eq!(sorted.tile_instance_vec.len(), 6 * n * n);
+            for (tile, (_, value)) in sorted.tile_instance_vec.iter().zip(&sorted.render_data_vec) {
+                if (tile.to_local * (tile.tile_center - vec3(0., -60., 20.))).z > 0. {
+                    assert!(
+                        value.is_some(),
+                        "rear-facing tiles need the reversed presort stream"
+                    );
+                }
+            }
+            wang.build_tiles(vec3(60., 0., 20.));
+            let after: Vec<_> = wang
+                .tile_map
+                .iter()
+                .map(|t| t.as_ref().unwrap().tid)
+                .collect();
+            assert_eq!(
+                original, after,
+                "camera movement must not reshuffle the finite sphere"
+            );
+        }
+        config.surface_type = SurfaceType::None;
+        config.height_map_wh = vec2(1, 1);
+        config.height_map_type = HeightMapType::SlopeX;
+        assert_eq!(wang.configure(config).tile_map_wh, vec2(15, 11));
+    }
+
+    #[test]
+    fn cubed_sphere_reverse_presort_preserves_lod_alignment() {
+        let base = TileBaseData {
+            splat_count: 4,
+            tile_center: Vec3::zero(),
+            aabb: (Vec3::zero(), Vec3::zero()),
+            raw_depth: vec![],
+            gs_index: vec![3, 8, 2, 9],
+            gs_lod_id: vec![0, 1, 0, 1],
+        };
+        let mut tile = TileInstance::new();
+        let plain = reversed_sphere_value(&base, &tile, 11);
+        assert_eq!(plain.gs_index, vec![2, 3]);
+        assert_eq!(plain.single_lod_id, 0);
+        assert_eq!(plain.gs_map_id, vec![11, 11]);
+        tile.transition_status = TileTransitionStatus::Changing(true);
+        let blend = reversed_sphere_value(&base, &tile, 12);
+        assert_eq!(blend.gs_index, vec![9, 2, 8, 3]);
+        assert_eq!(blend.gs_lod_id, Some(vec![1, 0, 1, 0]));
+        assert_eq!(blend.single_lod_id, -1);
     }
 
     fn member(xs: &[f32], weight_base: f32) -> MemberMotion {

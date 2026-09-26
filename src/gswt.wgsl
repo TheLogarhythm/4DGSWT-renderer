@@ -114,6 +114,8 @@ fn vs_main(
     var map_wh = 2u * u_scene.map_half_wh;
     if u_scene.surface_type != 2u {
         map_wh = map_wh + 1u;
+    } else {
+        map_wh = vec2(6u * u_scene.sphere_tiles_per_face, u_scene.sphere_tiles_per_face);
     }
     if u_tile.single_draw == 1u {
         offset = vec3(
@@ -143,8 +145,11 @@ fn vs_main(
         }
     }
     // MOTION_FIELD_END:vertex
-    center = center + offset;
-    center *= u_scene.scene_scale;
+    if u_scene.surface_type == 2u {
+        center = center * u_scene.scene_scale + offset;
+    } else {
+        center = (center + offset) * u_scene.scene_scale;
+    }
     let ori_center = center;
 
     let map_xrange = (2.0 * f32(u_scene.map_half_wh.x) + 1.0) * u_scene.tile_width * u_scene.height_map_scale.x;
@@ -158,7 +163,7 @@ fn vs_main(
     var transform = mat3x3(vec3(1.0), vec3(1.0), vec3(1.0));
     var surface_normal = vec3(0.0, 0.0, 1.0);
     if u_scene.surface_type > 0u {
-        surface_mapping(center.xy, map_id, &mapped_center, &transform);
+        surface_mapping(center, map_id, &mapped_center, &transform);
         center = mapped_center + transform * vec3(0.0, 0.0, center.z);
         surface_normal = transform * surface_normal;
     }
@@ -177,7 +182,7 @@ fn vs_main(
         if t_ratio < 0.0 {
             // Changing
             let cam_dist = distance(center, u_camera.cam_pos);
-            if u_tile.single_draw == 1u {
+            if u_tile.single_draw == 1u && u_tile.changing_to_lower < 0 {
                 // Find current lod, cannot trust tid here, because could be merged tiles
                 // for (var i = 0u; i < u_scene.num_lod - 1; i += 1u) {
                 //     let dist = u_scene.transition_dist_vec[i / 4u][i % 4u];
@@ -638,6 +643,8 @@ struct SceneUniforms {
 
     map_half_wh: vec2<u32>,
     center_coord: vec2<i32>,
+    sphere_tiles_per_face: u32,
+    sphere_padding: u32,
     transition_dist_vec: array<vec4<f32>, 4>,
     height_map_scale: vec3<f32>,
     scene_scale: vec3<f32>,
@@ -770,59 +777,10 @@ fn randomVec3(seed: vec2<f32>) -> vec3<f32> {
     );
 }
 
-// Sphere surface
-fn sphere_get_uv(block_id_x: f32, block_id_y: f32, block_x: f32, block_y: f32) -> vec2<f32> {
-    let PI = 3.1415926535897932384626433832795;
-    let xmax = f32(u_scene.map_half_wh.x) * 2.0 * u_scene.tile_width;
-    let block_w = xmax / 5.0;
-
-    var u = 0.0;
-    var v = 0.0;
-    if block_id_y == 0.0 {
-        if block_y < block_x {
-            if block_x - block_y == block_w {
-                u = 0.0;
-            } else {
-                u = (block_y / (block_w - (block_x - block_y)) + block_id_x) / 5.0;
-            }
-            v = (block_w - (block_x - block_y)) / block_w / 3.0;
-        } else {
-            u = (block_x / block_w + block_id_x) / 5.0 + (block_y - block_x) / block_w * 0.1;
-            v = (block_y - block_x) / block_w / 3.0 + 1.0 / 3.0;
-        }
-    } else {
-        if block_y < block_x {
-            u = (block_x / block_w + block_id_x) / 5.0 + (block_w - (block_x - block_y)) / block_w * 0.1;
-            v = (block_w - (block_x - block_y)) / block_w / 3.0 + 1.0 / 3.0;
-        } else {
-            if (block_y - block_x == block_w) {
-                u = 0.0;
-            } else {
-                u = (block_x / (block_w - (block_y - block_x)) + block_id_x) / 5.0 + 0.1;
-            }
-            v = (block_y - block_x) / block_w / 3.0 + 2.0 / 3.0;
-        }
-    }
-
-    u += 0.5 * floor(v);
-    u *= 2.0 * PI;
-    v = (v - 0.5) * PI;
-
-    return vec2(u, v);
-}
-
-// Sphere surface
-fn sphere_uv_to_pos(uv: vec2<f32>) -> vec3<f32> {
-    return vec3(
-        cos(uv.y) * cos(uv.x),
-        cos(uv.y) * sin(uv.x),
-        sin(uv.y)
-    );
-}
-
 // Out: new position, to_world transform
-fn surface_mapping(pos: vec2<f32>, map_id: u32, new_pos: ptr<function, vec3<f32>>, transform: ptr<function, mat3x3<f32>>) {
+fn surface_mapping(position: vec3<f32>, map_id: u32, new_pos: ptr<function, vec3<f32>>, transform: ptr<function, mat3x3<f32>>) {
     let u_tile = u_tile_array[0];
+    let pos = position.xy;
     let DELTA = 0.001;
 
     (*new_pos) = vec3(pos, 0.0);
@@ -847,37 +805,14 @@ fn surface_mapping(pos: vec2<f32>, map_id: u32, new_pos: ptr<function, vec3<f32>
 
         (*transform) = mat3x3(local_x, local_y, local_z);
     } else if u_scene.surface_type == 2u {
-        let xmax = f32(u_scene.map_half_wh.x) * 2.0 * u_scene.tile_width;
-        let ymax = f32(u_scene.map_half_wh.y) * 2.0 * u_scene.tile_width;
-        let block_w = xmax / 5.0;
-
-        // new_pos -= self.coord_to_pos(self.map_to_coord(vec2(0, 0)));
-        (*new_pos).x -= f32(u_scene.center_coord.x - i32(u_scene.map_half_wh.x)) * u_scene.tile_width;
-        (*new_pos).y -= f32(u_scene.center_coord.y - i32(u_scene.map_half_wh.y)) * u_scene.tile_width;
-        var block_id_x = f32(5 * u_tile.map_coord.x / (u_scene.map_half_wh.x * 2));
-        var block_id_y = f32(2 * u_tile.map_coord.y / (u_scene.map_half_wh.y * 2));
-        if u_tile.single_draw == 1u {
-            let map_height = 2u * u_scene.map_half_wh.y;
-            let this_mc = vec2<u32>(map_id / map_height, map_id % map_height);
-            block_id_x = f32(5 * this_mc.x / (u_scene.map_half_wh.x * 2u));
-            block_id_y = f32(2 * this_mc.y / (u_scene.map_half_wh.y * 2u));
-        }
-        let block_x = (*new_pos).x - block_id_x * block_w;
-        let block_y = (*new_pos).y - block_id_y * block_w;
-
-        let uv = sphere_get_uv(block_id_x, block_id_y, block_x, block_y);
-        let local_z = sphere_uv_to_pos(uv);
-        (*new_pos) = local_z * u_scene.sphere_radius;
-
-        let dt = DELTA * ymax;
-        let pos_r = sphere_uv_to_pos(sphere_get_uv(block_id_x, block_id_y, block_x + dt, block_y)) * u_scene.sphere_radius;
-        let pos_l = sphere_uv_to_pos(sphere_get_uv(block_id_x, block_id_y, block_x - dt, block_y)) * u_scene.sphere_radius;
-        let pos_u = sphere_uv_to_pos(sphere_get_uv(block_id_x, block_id_y, block_x, block_y + dt)) * u_scene.sphere_radius;
-        let pos_d = sphere_uv_to_pos(sphere_get_uv(block_id_x, block_id_y, block_x, block_y - dt)) * u_scene.sphere_radius;
-
-        let local_x = (pos_r - pos_l) / (2.0 * dt);
-        let local_y = (pos_u - pos_d) / (2.0 * dt);
-
-        (*transform) = mat3x3(local_x, local_y, local_z);
+        let n = u_scene.sphere_tiles_per_face;
+        var coord = u_tile.map_coord;
+        if u_tile.single_draw == 1u { coord = vec2(map_id / n, map_id % n); }
+        let face = coord.x / n;
+        let origin = vec2(f32(i32(face * n) - i32(u_scene.map_half_wh.x) + u_scene.center_coord.x), f32(-i32(u_scene.map_half_wh.y) + u_scene.center_coord.y)) * u_scene.tile_width;
+        let result = cube_map(face, vec3(pos - origin, position.z), n, u_scene.tile_width, u_scene.sphere_radius);
+        // Caller adds radial height; tangential derivatives already include it.
+        (*new_pos) = result.position - result.jacobian[2] * position.z;
+        (*transform) = result.jacobian;
     }
 }

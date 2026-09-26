@@ -26,7 +26,7 @@ pub struct UserData {
     pub config_id: u32,
     /// Half of width/height for tile map (in number of tiles)
     ///
-    /// Actual width/height computed based on surface type (2n or 2n+1)
+    /// Plane/heightfield extent is 2n+1. Cubed sphere has its own face count.
     pub tile_map_half_wh: Vector2<usize>,
     /// Number of center options for each tile (less equal than that provided during upload)
     pub center_option: usize,
@@ -44,6 +44,7 @@ pub struct UserData {
     pub height_map_scale: Vec3,
     pub height_tex: Option<(Vec<f32>, Vector2<usize>)>,
     pub sphere_radius: f32,
+    pub sphere_tiles_per_face: usize,
 
     // LOD
     pub lod_max_dist: f32,
@@ -86,7 +87,8 @@ impl UserData {
             height_map_type: HeightMapType::Random,
             height_map_scale: vec3(1.0, 1.0, 0.0),
             height_tex: None,
-            sphere_radius: 0.0,
+            sphere_radius: 20.0,
+            sphere_tiles_per_face: crate::cubed_sphere::DEFAULT_FACE_TILES,
             lod_max_dist: 0.0,
             lod_blending: true,
             lod_transition_width_ratio: 0.0,
@@ -118,6 +120,7 @@ pub struct UserDataString {
     pub height_map_wh_s: Vector2<String>,
     pub height_map_scale_s: Vector2<String>,
     pub sphere_radius_s: String,
+    pub sphere_tiles_per_face_s: String,
     pub merge_tile_dist_s: Vector2<String>,
     pub merge_dot_threshold_s: String,
     pub merge_topk_s: String,
@@ -136,6 +139,7 @@ impl UserDataString {
             height_map_wh_s: vec2(10.to_string(), 10.to_string()),
             height_map_scale_s: vec2(1.to_string(), 1.to_string()),
             sphere_radius_s: 20.to_string(),
+            sphere_tiles_per_face_s: crate::cubed_sphere::DEFAULT_FACE_TILES.to_string(),
             merge_tile_dist_s: vec2(3.to_string(), 10.to_string()),
             merge_dot_threshold_s: 0.2.to_string(),
             merge_topk_s: 100.to_string(),
@@ -147,16 +151,18 @@ impl UserDataString {
     }
 
     pub fn to_raw(&self, user_data: &mut UserData, err_msg: &mut Option<String>) {
-        parse_num(
-            &self.tile_map_half_wh_s.x,
-            &mut user_data.tile_map_half_wh.x,
-            err_msg,
-        );
-        parse_num(
-            &self.tile_map_half_wh_s.y,
-            &mut user_data.tile_map_half_wh.y,
-            err_msg,
-        );
+        if user_data.surface_type != SurfaceType::Sphere {
+            parse_num(
+                &self.tile_map_half_wh_s.x,
+                &mut user_data.tile_map_half_wh.x,
+                err_msg,
+            );
+            parse_num(
+                &self.tile_map_half_wh_s.y,
+                &mut user_data.tile_map_half_wh.y,
+                err_msg,
+            );
+        }
         parse_num(&self.center_option_s, &mut user_data.center_option, err_msg);
         parse_num(
             &self.update_dist_s,
@@ -165,45 +171,66 @@ impl UserDataString {
         );
         user_data.update_distance2 = user_data.update_distance2.powi(2);
         parse_num(&self.tile_width_s, &mut user_data.tile_width, err_msg);
-        parse_num(
-            &self.height_map_wh_s.x,
-            &mut user_data.height_map_wh.x,
-            err_msg,
-        );
-        parse_num(
-            &self.height_map_wh_s.y,
-            &mut user_data.height_map_wh.y,
-            err_msg,
-        );
-        parse_num(
-            &self.height_map_scale_s.x,
-            &mut user_data.height_map_scale.x,
-            err_msg,
-        );
-        user_data.height_map_scale.y = user_data.height_map_scale.x;
-        parse_num(
-            &self.height_map_scale_s.y,
-            &mut user_data.height_map_scale.z,
-            err_msg,
-        );
-        parse_num(&self.sphere_radius_s, &mut user_data.sphere_radius, err_msg);
-        parse_num(
-            &self.merge_tile_dist_s.x,
-            &mut user_data.merge_tile_dist.0,
-            err_msg,
-        );
-        parse_num(
-            &self.merge_tile_dist_s.y,
-            &mut user_data.merge_tile_dist.1,
-            err_msg,
-        );
-        parse_num(
-            &self.merge_dot_threshold_s,
-            &mut user_data.merge_dot_threshold,
-            err_msg,
-        );
-        parse_num(&self.merge_topk_s, &mut user_data.merge_topk, err_msg);
-
+        if user_data.surface_type != SurfaceType::Sphere {
+            parse_num(
+                &self.height_map_wh_s.x,
+                &mut user_data.height_map_wh.x,
+                err_msg,
+            );
+            parse_num(
+                &self.height_map_wh_s.y,
+                &mut user_data.height_map_wh.y,
+                err_msg,
+            );
+            parse_num(
+                &self.height_map_scale_s.x,
+                &mut user_data.height_map_scale.x,
+                err_msg,
+            );
+            user_data.height_map_scale.y = user_data.height_map_scale.x;
+            parse_num(
+                &self.height_map_scale_s.y,
+                &mut user_data.height_map_scale.z,
+                err_msg,
+            );
+        }
+        if user_data.surface_type == SurfaceType::Sphere {
+            parse_num(&self.sphere_radius_s, &mut user_data.sphere_radius, err_msg);
+            parse_num(
+                &self.sphere_tiles_per_face_s,
+                &mut user_data.sphere_tiles_per_face,
+                err_msg,
+            );
+            if !(1..=crate::cubed_sphere::MAX_FACE_TILES).contains(&user_data.sphere_tiles_per_face)
+            {
+                *err_msg = Some(format!(
+                    "Tiles per face edge must be between 1 and {}.",
+                    crate::cubed_sphere::MAX_FACE_TILES
+                ));
+            } else if !user_data.sphere_radius.is_finite() || user_data.sphere_radius <= 0.0 {
+                *err_msg = Some("Sphere radius must be finite and positive.".into());
+            } else if !user_data.tile_width.is_finite() || user_data.tile_width <= 0.0 {
+                *err_msg = Some("Tile width must be finite and positive.".into());
+            }
+        }
+        if user_data.surface_type != SurfaceType::Sphere {
+            parse_num(
+                &self.merge_tile_dist_s.x,
+                &mut user_data.merge_tile_dist.0,
+                err_msg,
+            );
+            parse_num(
+                &self.merge_tile_dist_s.y,
+                &mut user_data.merge_tile_dist.1,
+                err_msg,
+            );
+            parse_num(
+                &self.merge_dot_threshold_s,
+                &mut user_data.merge_dot_threshold,
+                err_msg,
+            );
+            parse_num(&self.merge_topk_s, &mut user_data.merge_topk, err_msg);
+        }
         parse_num(&self.lod_max_dist_s, &mut user_data.lod_max_dist, err_msg);
         user_data.lod_max_dist *= user_data.tile_width;
         parse_num(
@@ -216,7 +243,52 @@ impl UserDataString {
             &mut user_data.lod_dist_tolerance,
             err_msg,
         );
-        parse_num(&self.cache_size_s, &mut user_data.cache_size, err_msg);
+        if user_data.surface_type != SurfaceType::Sphere {
+            parse_num(&self.cache_size_s, &mut user_data.cache_size, err_msg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cubed_config_tests {
+    use super::*;
+
+    #[test]
+    fn cubed_sphere_config_validates_visible_fields_and_preserves_plane_extent() {
+        let mut raw = UserData::new();
+        raw.surface_type = SurfaceType::Sphere;
+        let mut text = UserDataString::new();
+        text.tile_map_half_wh_s = vec2("unused".into(), "unused".into());
+        text.sphere_tiles_per_face_s = "3".into();
+        text.height_map_wh_s = vec2("unused".into(), "unused".into());
+        text.height_map_scale_s = vec2("unused".into(), "unused".into());
+        text.merge_tile_dist_s = vec2("unused".into(), "unused".into());
+        text.merge_dot_threshold_s = "unused".into();
+        text.merge_topk_s = "unused".into();
+        text.cache_size_s = "unused".into();
+        let mut error = None;
+        text.to_raw(&mut raw, &mut error);
+        assert_eq!(error, None);
+        assert_eq!(raw.sphere_tiles_per_face, 3);
+        assert_eq!(raw.tile_map_half_wh, vec2(48, 48));
+        for invalid in ["0", "-1", "129", "100000000000000000000000000", "abc"] {
+            error = None;
+            text.sphere_tiles_per_face_s = invalid.into();
+            text.to_raw(&mut raw, &mut error);
+            assert!(error.is_some(), "N={invalid}");
+        }
+        text.sphere_tiles_per_face_s = "1".into();
+        for invalid in ["0", "-2", "NaN", "inf"] {
+            error = None;
+            text.sphere_radius_s = invalid.into();
+            text.to_raw(&mut raw, &mut error);
+            assert!(error.is_some(), "radius={invalid}");
+        }
+        text.sphere_radius_s = "20".into();
+        text.tile_width_s = "0".into();
+        error = None;
+        text.to_raw(&mut raw, &mut error);
+        assert!(error.is_some());
     }
 }
 

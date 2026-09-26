@@ -149,6 +149,40 @@ impl Camera {
         );
     }
 
+    /// Frame an origin-centered sphere with a small screen-space margin.
+    /// Called on configuration, so subsequent manual navigation stays unrestricted.
+    pub fn frame_sphere(&mut self, radius: f32) {
+        if !radius.is_finite()
+            || radius <= 0.0
+            || self.viewport.width == 0
+            || self.viewport.height == 0
+        {
+            return;
+        }
+        let aspect = self.viewport.width as f32 / self.viewport.height as f32;
+        let half_tan = (self.fovy / 2.0).tan() * aspect.min(1.0);
+        // A sphere's silhouette subtends asin(R / distance), not atan(R / distance).
+        // Occupy 95% of the limiting screen dimension (2.5% margin on each side).
+        let angle = (0.95 * half_tan).atan();
+        let distance = radius / angle.sin();
+        let direction = if self.position.magnitude2() > 1e-12 {
+            self.position.normalize()
+        } else {
+            vec3(1.0, -1.0, 0.6).normalize()
+        };
+        let up = if direction.dot(Vec3::unit_z()).abs() < 0.99 {
+            Vec3::unit_z()
+        } else {
+            Vec3::unit_y()
+        };
+        self.set_view(direction * distance, Vec3::zero(), up);
+        self.set_perspective_projection(
+            self.fovy,
+            self.z_near.min((distance - radius) * 0.5),
+            self.z_far.max(distance + radius * 2.0),
+        );
+    }
+
     pub fn set_perspective_projection(
         &mut self,
         fovy: impl Into<Radians>,
@@ -242,6 +276,49 @@ impl CameraUniforms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sphere_framing_fills_the_short_axis_without_clipping() {
+        for (width, height) in [(1920, 1080), (1080, 1920), (800, 800)] {
+            for radius in [0.01, 20.0, 2000.0] {
+                for fov in [30.0, 90.0] {
+                    let mut camera = Camera::new_perspective(
+                        PhysicalSize::new(width, height),
+                        vec3(0.0, 0.0, 5.0),
+                        vec3(0.0, 1.0, 5.0),
+                        Vec3::unit_z(),
+                        degrees(fov),
+                        0.1,
+                        2400.0,
+                    );
+                    camera.frame_sphere(radius);
+                    assert!(camera.position().magnitude() > radius);
+                    assert!(camera.target().magnitude() < 1e-6);
+                    let mut max_extent = 0.0f32;
+                    // Project independent surface samples through the actual camera.
+                    // A fixed distance multiplier fails for portrait/FOV changes;
+                    // stale clipping planes fail for tiny and large spheres.
+                    for latitude in 0..=64 {
+                        let phi = std::f32::consts::PI * latitude as f32 / 64.0;
+                        for longitude in 0..128 {
+                            let theta = std::f32::consts::TAU * longitude as f32 / 128.0;
+                            let point = radius
+                                * vec3(phi.sin() * theta.cos(), phi.sin() * theta.sin(), phi.cos());
+                            let clip = camera.view_proj() * point.extend(1.0);
+                            let ndc = clip.truncate() / clip.w;
+                            assert!(ndc.x.is_finite() && ndc.y.is_finite());
+                            assert!(ndc.z > -1.0 && ndc.z < 1.0);
+                            max_extent = max_extent.max(ndc.x.abs()).max(ndc.y.abs());
+                        }
+                    }
+                    assert!(
+                        (0.93..0.97).contains(&max_extent),
+                        "extent={max_extent}, {width}x{height}, R={radius}, FOV={fov}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn viewport_center_ray_points_at_the_camera_target() {

@@ -16,6 +16,37 @@ See [archive requirements](DEVELOPMENT.md#asset-contract) for supported versions
 | M / P | Toggle rendering menu / performance panel |
 | B | Toggle Motion when no text field has focus |
 
+## Cubed Sphere
+
+In **Config / Reconfig → Surface mapping**, select **Cubed Sphere** (replaces
+the old Sphere mapping). Set **Tiles per face edge (N)** and **Sphere radius**,
+then select **Confirm**. Start with N=8 and radius=20; the panel shows the total
+`6 × N × N` tile instances. Odd N is supported. This renderer currently accepts
+N=1–128; the practical limit depends on asset density, LoD and GPU memory.
+The sphere is centered at the world origin. Each **Confirm** frames the complete
+sphere from outside, looking at its center. Its diameter fills 95% of the limiting
+screen dimension, accounting for the current viewport and field of view. Normal
+camera movement remains available afterward; confirming again restores the fit.
+
+N controls the density of the grid and radius controls its world size. Tile width
+still describes the source asset. The plane's half-width/half-height controls are
+hidden in this mode and their values are retained for switching back. Planar
+scene-scale controls are also hidden; use N/radius for the spherical surface.
+
+The six face orientations preserve binary Wang labels and source-pattern
+direction for **rotated-edge assets** (`rotate_tile=true`), including the current
+sun-surface assets. No new tile variants or runtime orientation search is needed.
+Assets constructed with separate horizontal/vertical edge families are not
+guaranteed to match. Projection preserves shared boundary positions, but finite
+Gaussian support, motion and three-tile corner content can still reveal seams;
+test the intended asset at close range.
+
+Sphere uses per-tile sorting; planar selective merging, the flat proxy ground and
+water are disabled. Rear-facing tiles reuse reversed presort index streams,
+including LoD labels, instead of allocating a second full presort bank. Those
+draws require streamed index uploads. FPS depends on visible splat count and N;
+no fixed performance target is implied.
+
 ## Motion
 
 The Motion window opens for a newly configured dynamic archive. Its shared header

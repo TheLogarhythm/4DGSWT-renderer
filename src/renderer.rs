@@ -1110,7 +1110,8 @@ impl GSWTRenderer {
             let tid = tile_instance.tid;
 
             // viewport culling (only for non-merged tiles)
-            if render_data_key.tid.len() == 1 {
+            if self.user_data.surface_type != SurfaceType::Sphere && render_data_key.tid.len() == 1
+            {
                 let mut pos2d = vec3(f32::MAX, f32::MAX, -f32::MAX);
                 for ci in 0..4 {
                     let corner = view_proj
@@ -1338,6 +1339,7 @@ fn gs_shader_source(water: bool, underwater: bool) -> String {
     if water {
         [
             include_str!("camera.wgsl"),
+            include_str!("cubed_sphere.wgsl"),
             &crate::water_hits::shader_source(3),
             &if underwater {
                 crate::underwater::sampling_shader(3)
@@ -1350,6 +1352,7 @@ fn gs_shader_source(water: bool, underwater: bool) -> String {
     } else {
         [
             include_str!("camera.wgsl"),
+            include_str!("cubed_sphere.wgsl"),
             &body,
             include_str!("gswt_dry.wgsl"),
         ]
@@ -1722,7 +1725,8 @@ struct SceneUniforms {
 
     map_half_wh: [u32; 2],
     center_coord: [i32; 2],
-    _pad0: [u32; 2],
+    sphere_tiles_per_face: u32,
+    _pad0: u32,
     transition_dist_vec: [f32; 16],
     height_map_scale: [f32; 4],
     scene_scale: [f32; 4],
@@ -1778,15 +1782,28 @@ impl SceneUniforms {
                 user_data.tile_map_half_wh.y as u32,
             ],
             center_coord: [scene_data.center_coord.x, scene_data.center_coord.y],
-            _pad0: [0; 2],
+            sphere_tiles_per_face: user_data.sphere_tiles_per_face as u32,
+            _pad0: 0,
             transition_dist_vec: Self::expand_to_array::<16, f32>(
                 &user_data.lod_transition_dist,
                 0.0,
             ),
             scene_scale: [
-                render_config.scene_scale.x,
-                render_config.scene_scale.y,
-                render_config.scene_scale.z,
+                if user_data.surface_type == SurfaceType::Sphere {
+                    1.0
+                } else {
+                    render_config.scene_scale.x
+                },
+                if user_data.surface_type == SurfaceType::Sphere {
+                    1.0
+                } else {
+                    render_config.scene_scale.y
+                },
+                if user_data.surface_type == SurfaceType::Sphere {
+                    1.0
+                } else {
+                    render_config.scene_scale.z
+                },
                 0.0,
             ],
             height_map_scale: [
@@ -1841,6 +1858,13 @@ impl TileUniforms {
             uniforms.single_draw = 1;
             uniforms.single_lod_id = data_value.single_lod_id;
             uniforms.changing = (uniforms.single_lod_id == -1) as u32;
+            // Streaming indices does not imply merging multiple tiles. Preserve
+            // a single tile's known LoD pair (rear sphere and authored streams).
+            if !matches!(tile.merge_status, TileMergeStatus::MergedFrom(_)) {
+                if let TileTransitionStatus::Changing(to_lower) = tile.transition_status {
+                    uniforms.changing_to_lower = to_lower as i32;
+                }
+            }
         } else {
             if let TileTransitionStatus::Changing(to_lower) = tile.transition_status {
                 uniforms.changing = 1;
