@@ -70,6 +70,14 @@ Plane and Sphere bind a neutral 1×1 height texture; only HeightMap generates or
 resamples terrain. This also keeps initial Plane configuration valid before any
 height-map settings have been parsed.
 
+### Shared water preparation
+
+`state.rs` shares one `WaterFrame` across water, proxy and Gaussian preparation.
+Depth load/clear follows the preceding passes' actual result, including the
+sphere proxy skip. Flat-water intersection keys omit ineffective wave parameters
+and phases. Scattering retains phase dependence when light shafts are active;
+ripple shading and receiver caustics continue receiving live animation uniforms.
+
 Authoring stores an ordered stroke document with a moving XY cache:
 `RGBA8Unorm` continuous fields plus `R8Uint` controller assignment. A 97×97-tile
 Default cache is 1552×1552 (about 11.5 MiB). Recenter reuses overlap and replays

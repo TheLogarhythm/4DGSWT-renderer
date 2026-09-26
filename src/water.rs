@@ -264,6 +264,33 @@ pub(crate) fn bounds(user: &UserData, data: &RenderData) -> Option<[f32; 4]> {
     (result.iter().all(|value| value.is_finite()) && hx > 0.0 && hy > 0.0).then_some(result)
 }
 
+/// Shared water coverage and camera medium for all passes in one frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WaterFrame {
+    pub active: bool,
+    pub bounds: Option<[f32; 4]>,
+    pub underwater: Option<UnderwaterFrame>,
+}
+
+impl WaterFrame {
+    pub(crate) fn new(camera: &Camera, user: &UserData, data: &RenderData) -> Self {
+        let settings = &data.render_config.water;
+        let bounds = settings
+            .is_active(user.surface_type)
+            .then(|| bounds(user, data))
+            .flatten();
+        let position = camera.position();
+        let underwater = bounds.and_then(|bounds| {
+            settings.underwater_frame([position.x, position.y, position.z], Some(bounds))
+        });
+        Self {
+            active: bounds.is_some(),
+            bounds,
+            underwater,
+        }
+    }
+}
+
 pub struct WaterRenderer {
     pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
@@ -480,12 +507,38 @@ impl WaterRenderer {
         environment: Option<&WaterEnvironment>,
         timestamps: crate::profiler::WaterPassTimestamps<'_>,
     ) -> bool {
+        let frame = WaterFrame::new(camera, user, data);
+        self.prepare_frame(
+            device,
+            queue,
+            encoder,
+            camera,
+            user,
+            data,
+            environment,
+            timestamps,
+            &frame,
+        )
+    }
+
+    pub(crate) fn prepare_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        _user: &UserData,
+        data: &RenderData,
+        environment: Option<&WaterEnvironment>,
+        timestamps: crate::profiler::WaterPassTimestamps<'_>,
+        frame: &WaterFrame,
+    ) -> bool {
         let settings = &data.render_config.water;
-        if !settings.is_active(user.surface_type) {
+        if !frame.active {
             self.release_underwater();
             return false;
         }
-        let Some(bounds) = bounds(user, data) else {
+        let Some(bounds) = frame.bounds else {
             self.release_underwater();
             return false;
         };
@@ -493,8 +546,7 @@ impl WaterRenderer {
             return false;
         };
         let position = camera.position();
-        let underwater =
-            settings.underwater_frame([position.x, position.y, position.z], Some(bounds));
+        let underwater = frame.underwater;
         let uniforms = Uniforms {
             camera: CameraUniforms::from_camera(camera),
             bounds,
@@ -569,8 +621,18 @@ impl WaterRenderer {
             camera: uniforms.camera,
             bounds,
             level: [settings.height, 0.0, 0.0, 0.0],
-            waves: uniforms.waves,
-            phases: uniforms.phases,
+            // The flat solver does not read wave shape or phase. Canonicalize
+            // only the key so the live shading uniforms keep animating.
+            waves: if uniforms.waves[0] > 0.0 {
+                uniforms.waves
+            } else {
+                [0.0; 4]
+            },
+            phases: if uniforms.waves[0] > 0.0 {
+                uniforms.phases
+            } else {
+                [0.0; 4]
+            },
         };
         let update_hits = hits_replaced
             || self
@@ -656,14 +718,16 @@ impl WaterRenderer {
         pass.draw(0..3, 0..1);
     }
 
-    /// Draw after the proxy, loading its depth when present. Requires successful prepare.
-    pub fn render_surface(
+    /// Draw after successful preparation, loading depth only if a preceding pass
+    /// actually initialized it.
+    pub(crate) fn render_surface_prepared(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         data: &RenderData,
         environment: Option<&WaterEnvironment>,
         timestamps: crate::profiler::WaterPassTimestamps<'_>,
+        depth_prepared: bool,
     ) {
         let depth = data.depth_texture.as_ref().unwrap();
         let hits = self.hits.as_ref().unwrap();
@@ -681,7 +745,7 @@ impl WaterRenderer {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth.view,
                 depth_ops: Some(wgpu::Operations {
-                    load: if data.use_proxy {
+                    load: if depth_prepared {
                         wgpu::LoadOp::Load
                     } else {
                         wgpu::LoadOp::Clear(1.0)

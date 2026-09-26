@@ -26,9 +26,17 @@ pub(crate) struct Uniforms {
 }
 
 impl Uniforms {
-    /// The volume shader never reads receiver caustics. Exclude them from its cache key.
+    /// Keep only effective volume dependencies; receiver uniforms remain live.
     pub fn volume_key(mut self) -> Self {
         self.caustics = [0.0; 4];
+        if self.waves[0] <= 0.0 {
+            self.waves = [0.0; 4];
+            // Flat interfaces need no phases, but authored light shafts drift
+            // with them even when the geometric water surface is stationary.
+            if self.lighting[2] <= 0.0 || self.sun[3] <= 0.0 {
+                self.phases = [0.0; 4];
+            }
+        }
         self
     }
 

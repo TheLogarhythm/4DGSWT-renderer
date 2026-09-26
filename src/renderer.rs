@@ -996,23 +996,38 @@ impl GSWTRenderer {
         water_hits: Option<&wgpu::BindGroup>,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) -> FrameCounters {
+        let frame = crate::water::WaterFrame::new(camera, &self.user_data, render_data);
+        self.render_prepared(
+            queue,
+            encoder,
+            view,
+            camera,
+            render_data,
+            depth_prepared,
+            water_hits,
+            timestamp_writes,
+            &frame,
+        )
+    }
+
+    pub(crate) fn render_prepared(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        camera: &Camera,
+        render_data: &RenderData,
+        depth_prepared: bool,
+        water_hits: Option<&wgpu::BindGroup>,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+        frame: &crate::water::WaterFrame,
+    ) -> FrameCounters {
         let scene_data = render_data.cur_scene_data.as_ref().unwrap();
         let sort_data = render_data.cur_sort_data.as_ref().unwrap();
         let render_config = &render_data.render_config;
         let profiling = render_data.profiler_enabled;
-        let water_bounds = crate::water::bounds(&self.user_data, render_data);
-        let water_active = water_hits.is_some()
-            && render_config.water.is_active(self.user_data.surface_type)
-            && water_bounds.is_some();
-        let underwater = if water_active {
-            let position = camera.position();
-            render_config
-                .water
-                .underwater_frame([position.x, position.y, position.z], water_bounds)
-        } else {
-            None
-        };
-        let underwater_active = underwater.is_some();
+        let water_active = water_hits.is_some() && frame.active;
+        let underwater_active = water_active && frame.underwater.is_some();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1064,6 +1079,7 @@ impl GSWTRenderer {
                 &self.user_data,
                 scene_data,
                 render_data,
+                frame,
             )),
         );
 
@@ -1747,19 +1763,21 @@ impl SceneUniforms {
         user_data.n_tiles.0 as u32
     }
 
-    fn from_data(user_data: &UserData, scene_data: &SceneData, render_data: &RenderData) -> Self {
+    fn from_data(
+        user_data: &UserData,
+        scene_data: &SceneData,
+        render_data: &RenderData,
+        frame: &crate::water::WaterFrame,
+    ) -> Self {
         let render_config = &render_data.render_config;
-        let water_bounds = crate::water::bounds(user_data, render_data);
-        let water_active =
-            render_config.water.is_active(user_data.surface_type) && water_bounds.is_some();
         Self {
             water_level: [
                 render_config.water.height,
-                u32::from(water_active) as f32,
+                u32::from(frame.active) as f32,
                 0.0,
                 0.0,
             ],
-            water_bounds: water_bounds.unwrap_or([0.0; 4]),
+            water_bounds: frame.bounds.unwrap_or([0.0; 4]),
             water_waves: render_config.water.waves(),
             water_phases: render_config.water.phases(),
             splat_scale: render_config.splat_scale,

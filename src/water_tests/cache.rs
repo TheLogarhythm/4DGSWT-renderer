@@ -3,6 +3,167 @@ use super::harness::Harness;
 use crate::{test_support::gpu::read_texture_bytes, utils::*};
 
 #[test]
+fn skipped_sphere_proxy_cannot_preserve_stale_depth_for_gaussians() {
+    let mut h = Harness::new();
+    let reference = h.frame();
+    assert!(reference.pixels.chunks_exact(4).any(|p| p[0] > 100));
+    // Keep the visible GS fixture; only the proxy's sphere skip determines
+    // whether a preceding pass prepared depth for the Gaussian renderer.
+    h.user.surface_type = crate::structure::SurfaceType::Sphere;
+    h.data.use_proxy = true;
+    h.data.render_config.proxy_full = true;
+    let mut proxy = crate::proxy::Proxy::new(&h.device, &h.config);
+    proxy.configure(
+        &h.device,
+        &h.queue,
+        &h.user,
+        &h.data,
+        &(vec![vec![0.35, 0.4, 0.45, 1.0]], vec2(1, 1)),
+    );
+    h.proxy = Some(proxy);
+    let mut encoder = h.device.create_command_encoder(&Default::default());
+    {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("stale near depth from an earlier frame"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &h.data.depth_texture.as_ref().unwrap().view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
+    h.queue.submit(Some(encoder.finish()));
+    assert!(
+        h.frame() == reference,
+        "skipping the sphere proxy left stale depth that occluded Gaussian pixels"
+    );
+}
+
+#[test]
+fn flat_water_reuses_intersections_while_material_animation_stays_live() {
+    let mut h = Harness::new();
+    h.skybox.configure(
+        &h.device,
+        &h.queue,
+        &(
+            crate::skybox::SkyboxTexture::Cubemap(vec![vec![0.0, 1.0, 0.0, 1.0]; 6]),
+            vec2(1, 1),
+        ),
+    );
+    h.data.use_skybox = true;
+    h.data.render_config.water.enabled = true;
+    h.data.render_config.water.height = 0.6;
+    h.data.render_config.water.ripple_strength = 0.4;
+    let first = h.frame();
+    for _ in 0..3 {
+        h.data.render_config.water.advance(0.25);
+        h.frame();
+        assert_eq!(h.water.preparation_dispatches, [1, 0]);
+    }
+    assert_ne!(h.frame(), first, "flat geometry froze ripple shading");
+    h.data.render_config.water.wavelength = 8.0;
+    h.data.render_config.water.varied_waves = true;
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [1, 0],
+        "irrelevant wave shape invalidated a flat surface"
+    );
+    h.camera
+        .set_view(vec3(0.0, -0.2, 5.0), Vec3::zero(), vec3(0.0, 1.0, 0.0));
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [2, 0]);
+    h.data.render_config.water.amplitude = 0.08;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [3, 0]);
+    h.data.render_config.water.advance(0.25);
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [4, 0],
+        "active wave motion reused stale intersections"
+    );
+}
+
+#[test]
+fn flat_underwater_reuses_volume_without_freezing_caustics_or_shafts() {
+    let mut h = Harness::new();
+    h.camera.set_view(
+        vec3(0.0, -4.0, 2.0),
+        vec3(0.0, 3.0, -1.0),
+        vec3(0.0, 0.0, 1.0),
+    );
+    h.data.render_config.water.enabled = true;
+    h.data.render_config.water.height = 4.0;
+    h.data.render_config.water.underwater.enabled = true;
+    h.data.render_config.water.underwater.light_shafts = false;
+    h.data.render_config.water.underwater.caustics = true;
+    h.data.use_proxy = true;
+    h.data.render_config.proxy_full = true;
+    h.data.render_config.proxy_map = false;
+    h.data.render_config.proxy_height = -1.0;
+    let mut proxy = crate::proxy::Proxy::new(&h.device, &h.config);
+    proxy.configure(
+        &h.device,
+        &h.queue,
+        &h.user,
+        &h.data,
+        &(vec![vec![0.35, 0.4, 0.45, 1.0]], vec2(1, 1)),
+    );
+    h.proxy = Some(proxy);
+    let first = h.frame();
+    for _ in 0..3 {
+        h.data.render_config.water.advance(0.25);
+        h.frame();
+        assert_eq!(h.water.preparation_dispatches, [1, 1]);
+    }
+    assert_ne!(
+        h.frame(),
+        first,
+        "reusing the volume froze receiver caustics"
+    );
+    h.data.render_config.water.wavelength = 8.0;
+    h.data.render_config.water.varied_waves = true;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [1, 1]);
+    h.data.render_config.water.underwater.sun_azimuth += 10.0;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [1, 2]);
+    h.data.render_config.water.underwater.light_shafts = true;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [1, 3]);
+    h.data.render_config.water.advance(0.25);
+    h.frame();
+    assert_eq!(
+        h.water.preparation_dispatches,
+        [1, 4],
+        "flat water must still animate enabled shafts"
+    );
+    h.data.render_config.water.underwater.light_shafts = false;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [1, 5]);
+    h.data.render_config.water.amplitude = 0.08;
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [2, 6]);
+    h.data.render_config.water.advance(0.25);
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [3, 7]);
+    h.camera.set_view(
+        vec3(0.0, -4.2, 2.0),
+        vec3(0.0, 3.0, -1.0),
+        vec3(0.0, 0.0, 1.0),
+    );
+    h.frame();
+    assert_eq!(h.water.preparation_dispatches, [4, 8]);
+}
+
+#[test]
 fn underwater_single_background_matches_the_overwritten_sky_across_the_waterline() {
     let mut h = Harness::new();
     h.skybox.configure(

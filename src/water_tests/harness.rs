@@ -247,7 +247,7 @@ impl Harness {
                     .filter(|_| self.data.use_skybox),
             );
         }
-        if let Some(proxy) = self.proxy.as_mut() {
+        let proxy_depth_prepared = if let Some(proxy) = self.proxy.as_mut() {
             proxy.render_with_water(
                 &self.queue,
                 encoder,
@@ -255,10 +255,12 @@ impl Harness {
                 &self.camera,
                 &self.data,
                 self.water.hits().filter(|_| water_drawn).map(|h| &h.read),
-            );
-        }
+            )
+        } else {
+            false
+        };
         if water_drawn {
-            self.water.render_surface(
+            self.water.render_surface_prepared(
                 encoder,
                 &view,
                 &self.data,
@@ -274,6 +276,7 @@ impl Harness {
                         end_of_pass_write_index: Some(4),
                     }),
                 },
+                proxy_depth_prepared,
             );
         }
         self.gs.render(
@@ -282,7 +285,7 @@ impl Harness {
             &view,
             &self.camera,
             &self.data,
-            self.data.use_proxy || water_drawn,
+            proxy_depth_prepared || water_drawn,
             self.water.hits().filter(|_| water_drawn).map(|h| &h.read),
             queries.map(|query_set| wgpu::RenderPassTimestampWrites {
                 query_set,

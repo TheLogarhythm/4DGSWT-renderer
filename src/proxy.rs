@@ -435,18 +435,36 @@ impl Proxy {
         camera: &Camera,
         render_data: &RenderData,
         water_hits: Option<&wgpu::BindGroup>,
-    ) {
-        let underwater = if render_data
-            .render_config
-            .water
-            .is_active(self.user_data.surface_type)
-            && water_hits.is_some()
-        {
-            let position = camera.position();
-            render_data.render_config.water.underwater_frame(
-                [position.x, position.y, position.z],
-                water::bounds(&self.user_data, render_data),
-            )
+    ) -> bool {
+        let frame = water::WaterFrame::new(camera, &self.user_data, render_data);
+        self.render_prepared(
+            queue,
+            encoder,
+            view,
+            camera,
+            render_data,
+            water_hits,
+            &frame,
+        )
+    }
+
+    /// Returns whether this pass cleared and prepared depth for later draws.
+    pub(crate) fn render_prepared(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        camera: &Camera,
+        render_data: &RenderData,
+        water_hits: Option<&wgpu::BindGroup>,
+        frame: &water::WaterFrame,
+    ) -> bool {
+        // The proxy is a plane/heightfield; do not draw it through the sun sphere.
+        if self.user_data.surface_type == SurfaceType::Sphere {
+            return false;
+        }
+        let underwater = if frame.active && water_hits.is_some() {
+            frame.underwater
         } else {
             None
         };
@@ -529,6 +547,7 @@ impl Proxy {
                 0..1,
             );
         }
+        true
     }
 }
 

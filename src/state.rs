@@ -949,25 +949,16 @@ impl State {
                 {
                     rd.step_frame = false;
 
-                    let water_active = rd
-                        .render_config
-                        .water
-                        .is_active(self.gui.config_user_data.surface_type);
-                    let underwater = if water_active {
-                        let position = self.camera.position();
-                        rd.render_config.water.underwater_frame(
-                            [position.x, position.y, position.z],
-                            water::bounds(&self.gui.config_user_data, rd),
-                        )
-                    } else {
-                        None
-                    };
+                    let water_frame =
+                        water::WaterFrame::new(&self.camera, &self.gui.config_user_data, rd);
+                    let water_active = water_frame.active;
+                    let underwater = water_frame.underwater;
                     let water_drawn = if water_active {
                         self.water
                             .get_or_insert_with(|| {
                                 WaterRenderer::new(&self.device, self.config.format)
                             })
-                            .prepare(
+                            .prepare_frame(
                                 &self.device,
                                 &self.queue,
                                 &mut encoder,
@@ -979,6 +970,7 @@ impl State {
                                     .as_ref()
                                     .filter(|_| rd.use_skybox),
                                 self.profiler.water_timestamp_writes(),
+                                &water_frame,
                             )
                     } else {
                         if let Some(water) = self.water.as_mut() {
@@ -1024,8 +1016,8 @@ impl State {
                         });
                     }
 
-                    if rd.use_proxy {
-                        self.proxy.render_with_water(
+                    let proxy_depth_prepared = if rd.use_proxy {
+                        self.proxy.render_prepared(
                             &self.queue,
                             &mut encoder,
                             &view,
@@ -1036,10 +1028,13 @@ impl State {
                                 .and_then(|w| w.hits())
                                 .filter(|_| water_drawn)
                                 .map(|h| &h.read),
-                        );
-                    }
+                            &water_frame,
+                        )
+                    } else {
+                        false
+                    };
                     if water_drawn {
-                        self.water.as_ref().unwrap().render_surface(
+                        self.water.as_ref().unwrap().render_surface_prepared(
                             &mut encoder,
                             &view,
                             rd,
@@ -1048,6 +1043,7 @@ impl State {
                                 .as_ref()
                                 .filter(|_| rd.use_skybox),
                             self.profiler.water_timestamp_writes(),
+                            proxy_depth_prepared,
                         );
                     }
 
@@ -1057,19 +1053,20 @@ impl State {
                     if rd.render_gs {
                         let render_cpu_start = get_time_milliseconds();
                         let timestamp_writes = self.profiler.render_timestamp_writes();
-                        let work = renderer.render(
+                        let work = renderer.render_prepared(
                             &self.queue,
                             &mut encoder,
                             &view,
                             &self.camera,
                             rd,
-                            rd.use_proxy || water_drawn,
+                            proxy_depth_prepared || water_drawn,
                             self.water
                                 .as_ref()
                                 .and_then(|w| w.hits())
                                 .filter(|_| water_drawn)
                                 .map(|h| &h.read),
                             timestamp_writes,
+                            &water_frame,
                         );
                         self.profiler.counters_mut().merge_render_work(work);
                         self.profiler.record_render_cpu(
